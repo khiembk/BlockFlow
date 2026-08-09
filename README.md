@@ -140,6 +140,38 @@ write outputs under `outputs/` by default and accept checkpoint-related override
 `MODEL_PATH`, `EVAL_MODEL_KEY`, `CKPT_FILE` or `CKPT`, and `USE_EMA`. `LM1B_MODEL_KEY`
 and `LM1B_MODEL_PATH` are accepted by the LM1B likelihood wrapper.
 
+### GSM8K Distillation Data
+
+The GSM8K training wrappers for AR, MDLM, BD3LM, and SetDLM use distilled
+teacher answers saved as preprocessed Hugging Face datasets. Build them before
+launching GSM8K distillation training:
+
+```bash
+bash bash_scripts/run_build_gsm8k_distill.sh
+```
+
+By default this writes:
+
+```text
+outputs/distillation/Qwen3-32B-AWQ/gsm8k_train
+outputs/distillation/Qwen3-32B-AWQ/gsm8k_eval
+```
+
+Set `DLLM_DISTILL_DATA_DIR` if you want the datasets somewhere else, and use the
+same value when launching training:
+
+```bash
+DLLM_DISTILL_DATA_DIR=/path/to/Qwen3-32B-AWQ bash bash_scripts/run_build_gsm8k_distill.sh
+DLLM_DISTILL_DATA_DIR=/path/to/Qwen3-32B-AWQ NUM_VISIBLE_DEVICES=8 bash bash_scripts/run_train_setdlm_gsm8k.sh
+```
+
+The builder defaults to `Qwen/Qwen3-32B-AWQ` as the teacher and
+`Qwen/Qwen3-1.7B-Base` as the student tokenizer. Override them with
+`DISTILL_TEACHER_MODEL` and `DISTILL_STUDENT_TOKENIZER`. For a fast smoke test
+that validates the preprocessing path without loading the teacher model, set
+`DISTILL_USE_GOLD_ANSWERS=true`; this does not reproduce the paper distillation
+data.
+
 Evaluation scripts are provided for the following tasks:
 - Text summarization: [`run_seq2seq_eval_cnndm.sh`](bash_scripts/run_seq2seq_eval_cnndm.sh)
 - Mathematical reasoning: [`run_lm_eval_harness.sh`](bash_scripts/run_lm_eval_harness.sh), [`run_likelihood_eval_gsm8k.sh`](bash_scripts/run_likelihood_eval_gsm8k.sh)

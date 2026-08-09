@@ -39,7 +39,16 @@ def load_preprocessed_dataset(
         Union[Dataset, DatasetDict]: The loaded dataset.
     """
     if not fsspec_exists(dataset_path):
-        raise FileNotFoundError(f"Dataset not found at {dataset_path}.")
+        message = f"Dataset not found at {dataset_path}."
+        normalized_path = dataset_path.rstrip("/")
+        if normalized_path.endswith(("gsm8k_train", "gsm8k_eval")):
+            message += (
+                " Build the GSM8K distillation data with "
+                "`bash bash_scripts/run_build_gsm8k_distill.sh`, or set "
+                "`DLLM_DISTILL_DATA_DIR` to a directory containing "
+                "`gsm8k_train` and `gsm8k_eval`."
+            )
+        raise FileNotFoundError(message)
     dataset = load_from_disk(
         dataset_path, keep_in_memory=keep_in_memory, storage_options=storage_options
     ).with_format("torch")
