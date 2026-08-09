@@ -15,6 +15,7 @@ ARGS=(
   --max-new-tokens "${DISTILL_MAX_NEW_TOKENS:-1024}"
   --device-map "${DISTILL_DEVICE_MAP:-auto}"
   --torch-dtype "${DISTILL_TORCH_DTYPE:-bfloat16}"
+  --chat-eos-token "${DISTILL_CHAT_EOS_TOKEN:-<|im_end|>}"
 )
 
 if [ -n "${DISTILL_LIMIT_TRAIN:-}" ]; then

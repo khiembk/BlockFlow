@@ -166,7 +166,10 @@ DLLM_DISTILL_DATA_DIR=/path/to/Qwen3-32B-AWQ NUM_VISIBLE_DEVICES=8 bash bash_scr
 ```
 
 The builder defaults to `Qwen/Qwen3-32B-AWQ` as the teacher and
-`Qwen/Qwen3-1.7B-Base` as the student tokenizer. Override them with
+`Qwen/Qwen3-1.7B-Base` as the student tokenizer. It saves the same artifact
+shape used by the local L=1024 GSM8K distillation datasets: `input_ids` plus
+`index`, final sequences capped at 1024 tokens, and chat rows terminated with
+`<|im_end|>`. Override the teacher and student tokenizer with
 `DISTILL_TEACHER_MODEL` and `DISTILL_STUDENT_TOKENIZER`. For a fast smoke test
 that validates the preprocessing path without loading the teacher model, set
 `DISTILL_USE_GOLD_ANSWERS=true`; this does not reproduce the paper distillation

@@ -6,7 +6,10 @@ The GSM8K distillation configs expect Hugging Face datasets saved at:
     outputs/distillation/Qwen3-32B-AWQ/gsm8k_eval
 
 Each row contains tokenized prompt plus teacher answer in the student tokenizer's
-vocabulary. Context masks are injected later by
+vocabulary. Rows intentionally match the local L=1024 distillation artifacts:
+only ``input_ids`` and ``index`` are saved, teacher-generated token IDs are
+concatenated directly after prompt token IDs, and chat-formatted examples
+terminate with ``<|im_end|>``. Context masks are injected later by
 configs/dataset/gsm8k_train_distill.yaml.
 """
 
@@ -28,6 +31,7 @@ SOURCE_PROMPT_TEXT = (
     "Please reason step by step, and put your final answer within $\\boxed{}$. "
 )
 TARGET_PROMPT_TEXT = "Answer: "
+CHAT_EOS_TOKEN = "<|im_end|>"
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--chat-eos-token", default=CHAT_EOS_TOKEN)
     parser.add_argument(
         "--use-gold-answers",
         action="store_true",
@@ -109,6 +114,15 @@ def resolve_torch_dtype(dtype_name: str):
     return dtype
 
 
+def ensure_chat_eos(text: str, chat_eos_token: str) -> str:
+    if not chat_eos_token:
+        return text
+    eos_idx = text.find(chat_eos_token)
+    if eos_idx >= 0:
+        return text[: eos_idx + len(chat_eos_token)]
+    return text.rstrip() + chat_eos_token
+
+
 def load_teacher_model(args: argparse.Namespace):
     tokenizer = AutoTokenizer.from_pretrained(
         args.teacher_model,
@@ -134,13 +148,18 @@ def model_input_device(model: torch.nn.Module) -> torch.device:
 
 
 @torch.inference_mode()
-def generate_teacher_responses(
+def generate_teacher_response_ids(
     questions: list[str],
     tokenizer: PreTrainedTokenizerBase,
     model: torch.nn.Module,
     args: argparse.Namespace,
-) -> list[str]:
-    responses: list[str] = []
+) -> list[list[int]]:
+    chat_eos_ids = tokenizer.encode(
+        args.chat_eos_token,
+        add_special_tokens=False,
+    )
+    chat_eos_id = chat_eos_ids[0] if chat_eos_ids else None
+    response_ids: list[list[int]] = []
     batches = list(batched(questions, args.batch_size))
     for question_batch in tqdm(batches, desc="Generating teacher answers"):
         prompts = [
@@ -158,7 +177,7 @@ def generate_teacher_responses(
             "max_new_tokens": args.max_new_tokens,
             "do_sample": args.do_sample,
             "pad_token_id": tokenizer.pad_token_id,
-            "eos_token_id": tokenizer.eos_token_id,
+            "eos_token_id": chat_eos_id or tokenizer.eos_token_id,
         }
         if args.do_sample:
             generation_kwargs.update(
@@ -170,49 +189,53 @@ def generate_teacher_responses(
             )
         output_ids = model.generate(**inputs, **generation_kwargs)
         prompt_width = inputs["input_ids"].shape[-1]
-        responses.extend(
-            tokenizer.batch_decode(
-                output_ids[:, prompt_width:],
-                skip_special_tokens=False,
-            )
-        )
-    return responses
+        for generated_ids in output_ids[:, prompt_width:].tolist():
+            if chat_eos_id is not None and chat_eos_id in generated_ids:
+                eos_idx = generated_ids.index(chat_eos_id)
+                generated_ids = generated_ids[: eos_idx + 1]
+            elif chat_eos_id is not None:
+                generated_ids = generated_ids + [chat_eos_id]
+            response_ids.append(generated_ids)
+    return response_ids
 
 
-def tokenize_rows(
-    questions: list[str],
+def tokenize_responses(
     responses: list[str],
+    tokenizer: PreTrainedTokenizerBase,
+    chat_eos_token: str,
+) -> list[list[int]]:
+    return [
+        tokenizer(
+            ensure_chat_eos(response, chat_eos_token),
+            add_special_tokens=False,
+        )["input_ids"]
+        for response in responses
+    ]
+
+
+def build_rows_from_response_ids(
+    questions: list[str],
+    response_ids: list[list[int]],
     tokenizer: PreTrainedTokenizerBase,
     max_length: int,
 ) -> list[dict[str, list[int] | int]]:
     rows: list[dict[str, list[int] | int]] = []
-    eos_token = tokenizer.eos_token or ""
-    for idx, (question, response) in enumerate(zip(questions, responses)):
+    for idx, (question, response) in enumerate(zip(questions, response_ids)):
         prompt = render_chat_prompt(tokenizer, question)
-        text = prompt + response.strip()
-        if eos_token and not text.endswith(eos_token):
-            text += eos_token
-        encoded = tokenizer(
-            text,
-            max_length=max_length,
-            truncation=True,
-            add_special_tokens=False,
-        )
+        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         rows.append(
             {
-                "input_ids": encoded["input_ids"],
-                "attention_mask": encoded["attention_mask"],
+                "input_ids": (prompt_ids + response)[:max_length],
                 "index": idx,
             }
         )
     return rows
 
-
 def build_split(
     split_name: str,
     output_name: str,
     limit: int | None,
-    responses: list[str] | None,
+    response_ids: list[list[int]] | None,
     student_tokenizer: PreTrainedTokenizerBase,
     args: argparse.Namespace,
 ) -> None:
@@ -225,12 +248,22 @@ def build_split(
     if limit is not None:
         dataset = dataset.select(range(min(limit, len(dataset))))
     questions = list(dataset["question"])
-    if responses is None:
+    if response_ids is None:
         responses = [
             TARGET_PROMPT_TEXT + normalize_gsm8k_answer(answer)
             for answer in dataset["answer"]
         ]
-    rows = tokenize_rows(questions, responses, student_tokenizer, args.max_length)
+        response_ids = tokenize_responses(
+            responses,
+            student_tokenizer,
+            args.chat_eos_token,
+        )
+    rows = build_rows_from_response_ids(
+        questions,
+        response_ids,
+        student_tokenizer,
+        args.max_length,
+    )
     output_path = Path(args.output_dir) / output_name
     output_path.parent.mkdir(parents=True, exist_ok=True)
     Dataset.from_list(rows).save_to_disk(str(output_path))
@@ -256,7 +289,7 @@ def main() -> None:
         (args.eval_split, "gsm8k_eval", args.limit_eval),
     ]
     for split_name, output_name, limit in split_plan:
-        responses = None
+        response_ids = None
         if teacher_model is not None and teacher_tokenizer is not None:
             raw_dataset = load_dataset(
                 args.dataset_path,
@@ -266,7 +299,7 @@ def main() -> None:
             )
             if limit is not None:
                 raw_dataset = raw_dataset.select(range(min(limit, len(raw_dataset))))
-            responses = generate_teacher_responses(
+            response_ids = generate_teacher_response_ids(
                 list(raw_dataset["question"]),
                 teacher_tokenizer,
                 teacher_model,
@@ -276,7 +309,7 @@ def main() -> None:
             split_name,
             output_name,
             limit,
-            responses,
+            response_ids,
             student_tokenizer,
             args,
         )
