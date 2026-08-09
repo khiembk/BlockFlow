@@ -1,6 +1,6 @@
 # Set Diffusion: Interpolating Token Orderings between Autoregression and Diffusion for Fast and Flexible Decoding
 
-[![deploy](https://img.shields.io/badge/Paper_📃-green)](https://arxiv.org/abs/2510.22852)
+[![deploy](https://img.shields.io/badge/Paper_📃-green)](https://arxiv.org/abs/2607.01775)
 [![deploy](https://img.shields.io/badge/Blog_📝%20%20-8A2BE2)](https://m-arriola.com/setdlms)
 [![deploy](https://img.shields.io/badge/HuggingFace_🤗%20-SetDLMs%20-orange)](https://huggingface.co/collections/kuleshov-group/setdlms)
 
@@ -200,6 +200,7 @@ normalizes legacy checkpoint config and eval-time SetDLM noise/cache-order setti
   title={Set Diffusion: Interpolating Token Orderings Between Autoregression and Diffusion for Fast and Flexible Decoding},
   author={Arriola, Marianne and Kuleshov, Volodymyr},
   booktitle={The Forty-Third International Conference on Machine Learning},
-  year={2026}
+  year={2026},
+  url={https://arxiv.org/abs/2607.01775}
 }
 ```
