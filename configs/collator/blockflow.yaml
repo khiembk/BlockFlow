@@ -1,0 +1,9 @@
+defaults:
+  - denoising@_here_
+  - _self_
+
+# AdaptiveBlockFlow samples its own per-example scalar `t` and revelation round
+# inside `_prepare_inputs`; the collator only needs to handle padding and
+# `context_mask` propagation, not SetDLM/MDLM's per-block `t` tensor.
+sample_t: false
+block_size: null

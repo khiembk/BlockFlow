@@ -391,6 +391,134 @@ class CNNDailyMailDataset(Dataset):
             }
 
 
+class WMTDataset(Dataset):
+    """Parallel-corpus translation dataset (default: WMT14 de->en).
+
+    HF `datasets` stores each example as `{"translation": {<lang>: str, ...}}`;
+    this class follows the same tokenize-on-demand / `context_mask` / train-vs-eval
+    `separate_input_output` pattern as `CNNDailyMailDataset` above.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        split: Literal["train", "validation", "test"],
+        max_source_length: int,
+        max_target_length: int,
+        dataset_path: str = "wmt14",
+        config_name: str = "de-en",
+        source_lang: str = "de",
+        target_lang: str = "en",
+        padding: bool = False,
+        add_special_tokens: bool = True,
+        source_prompt_text: str | None = None,
+        target_prompt_text: str | None = None,
+        use_translation_prefix: bool = False,
+        separate_input_output: bool = False,
+        truncate: bool = True,
+        cache_path: str = "",
+        # Unused tokenizer arg (compat. with other dataset loading functions/classes)
+        **_: Dict[str, Any],
+    ):
+        self.tokenizer = tokenizer
+        self.cache_path = cache_path
+        if self.cache_path and fsspec_exists(self.cache_path):
+            self.dataset = load_preprocessed_dataset(self.cache_path)
+        else:
+            self.dataset = load_dataset(
+                dataset_path, config_name, split=split, trust_remote_code=True
+            )
+        self.max_source_length = max_source_length
+        self.max_target_length = max_target_length
+        self.padding = padding
+        self.add_special_tokens = add_special_tokens
+        if source_prompt_text is None and use_translation_prefix:
+            source_prompt_text = _TRANSLATION_PREFIX.format(
+                source=source_lang, target=target_lang
+            )
+        self.source_prompt_text = source_prompt_text
+        self.target_prompt_text = target_prompt_text
+        self.separate_input_output = separate_input_output
+        self.source_lang = source_lang
+        self.target_lang = target_lang
+        self.truncate = truncate
+
+    @property
+    def target_references(self) -> list[str]:
+        """Helper method to retrieve list of ground truth labels for downstream eval."""
+        return [ex[self.target_lang] for ex in self.dataset["translation"]]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        example = self.dataset[idx]["translation"]
+        source = example[self.source_lang]
+        target = example[self.target_lang]
+        if self.source_prompt_text is not None:
+            source = self.source_prompt_text + source
+        if self.target_prompt_text is not None:
+            target = self.target_prompt_text + target
+        if self.add_special_tokens:
+            source = self.tokenizer.bos_token + source + self.tokenizer.eos_token
+            target = target + self.tokenizer.eos_token
+        source_ids = self.tokenizer(
+            source,
+            add_special_tokens=self.add_special_tokens,
+            max_length=self.max_source_length,
+            truncation=self.truncate,
+        )
+        target_ids = self.tokenizer(
+            target,
+            add_special_tokens=self.add_special_tokens,
+            max_length=self.max_target_length,
+            truncation=self.truncate,
+        )
+        # inject eos token if it was cut off
+        if source_ids["input_ids"][-1] != self.tokenizer.eos_token_id:
+            source_ids["input_ids"][-1] = self.tokenizer.eos_token_id
+        if target_ids["input_ids"][-1] != self.tokenizer.eos_token_id:
+            target_ids["input_ids"][-1] = self.tokenizer.eos_token_id
+        if self.separate_input_output:
+            input_ids = torch.LongTensor(source_ids["input_ids"])
+            attention_mask = torch.LongTensor(source_ids["attention_mask"])
+            context_mask = torch.LongTensor(source_ids["attention_mask"])
+            output_ids = torch.LongTensor(target_ids["input_ids"])
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "context_mask": context_mask,
+                "output_ids": output_ids,
+            }
+        else:
+            input_ids = torch.cat(
+                [
+                    torch.LongTensor(source_ids["input_ids"]),
+                    torch.LongTensor(target_ids["input_ids"]),
+                ],
+                dim=-1,
+            )
+            attention_mask = torch.cat(
+                [
+                    torch.LongTensor(source_ids["attention_mask"]),
+                    torch.LongTensor(target_ids["attention_mask"]),
+                ],
+                dim=-1,
+            )
+            context_mask = torch.cat(
+                (
+                    torch.LongTensor(source_ids["attention_mask"]),
+                    torch.zeros_like(torch.LongTensor(target_ids["input_ids"])),
+                ),
+                dim=-1,
+            )
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "context_mask": context_mask,
+            }
+
+
 class ROCStoriesDataset(Dataset):
     def __init__(
         self,

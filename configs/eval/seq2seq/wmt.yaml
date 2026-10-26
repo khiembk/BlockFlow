@@ -4,3 +4,10 @@ defaults:
 
 dataset:
   _target_: src.datasets.tokenize_on_demand.WMTDataset
+  truncate: true
+  dataset_path: "wmt14"
+  config_name: "de-en"
+  source_lang: "de"
+  target_lang: "en"
+  max_source_length: 128
+  max_target_length: 128

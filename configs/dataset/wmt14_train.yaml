@@ -1,0 +1,14 @@
+_target_: src.datasets.tokenize_on_demand.WMTDataset
+split: "train"
+dataset_path: "wmt14"
+config_name: "de-en"
+source_lang: "de"
+target_lang: "en"
+max_source_length: 96
+max_target_length: 96
+padding: false
+add_special_tokens: true
+source_prompt_text: null
+target_prompt_text: null
+use_translation_prefix: false
+truncate: true

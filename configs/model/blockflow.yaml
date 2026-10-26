@@ -1,0 +1,9 @@
+defaults:
+  - base@_here_
+  - _self_
+
+_target_: src.denoiser.blockflow.AdaptiveBlockFlow
+config:
+  _target_: src.denoiser.blockflow.AdaptiveBlockFlowConfig
+  commit_size: ${block_size}
+  noise_config: null

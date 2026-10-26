@@ -47,6 +47,10 @@ class DenoiserInput(OrderedDict):
     t: Optional[torch.FloatTensor] = None  # (B,) | # (B, L)
     alpha_t: Optional[torch.FloatTensor] = None  # (B,) | (B, 1|L) | (B, 1|L, 1)
     alpha_t_prime: Optional[torch.FloatTensor] = None  # (B,) | (B, 1|L) | (B, 1|L, 1)
+    # Continuous Gaussian-to-categorical state at active positions, used by
+    # flow-matching denoisers (e.g. AdaptiveBlockFlow); unused by discrete denoisers.
+    continuous_states: Optional[torch.FloatTensor] = None  # (B, L, V)
+    active_mask: Optional[torch.BoolTensor] = None  # (B, L)
     backbone_kwargs: dict[str, Any] = field(default_factory=dict)
 
 

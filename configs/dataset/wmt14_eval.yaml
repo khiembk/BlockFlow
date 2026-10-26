@@ -1,0 +1,5 @@
+defaults:
+  - wmt14_train
+
+split: "validation"
+truncate: true
