@@ -1,0 +1,41 @@
+# WMT14 BLEU/chrF evaluation for AdaptiveBlockFlow (Stage 1 or Stage 2).
+# See scripts/eval/eval_wmt14_bleu.py.
+
+run_name: ???
+output_dir: ${cwd:}/outputs/eval/${run_name}
+
+model:
+  pretrained_model_name_or_path: ???  # a Stage-1 (or Stage-2) run dir with config.yaml
+  ckpt_file: "best-rank0.pt"
+  load_ema_weights: false
+
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: bert-base-multilingual-cased
+
+dataset:
+  _target_: src.datasets.tokenize_on_demand.WMTDataset
+  split: "test"
+  dataset_path: "wmt14"
+  config_name: "de-en"
+  source_lang: "de"
+  target_lang: "en"
+  max_source_length: 96
+  max_target_length: 96
+  add_special_tokens: true
+  truncate: true
+  separate_input_output: true
+
+generation:
+  max_new_tokens: 64
+  num_flow_steps: 16
+  do_sample: false
+
+num_samples: 500  # null evaluates the full split
+seed: 1
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: true
