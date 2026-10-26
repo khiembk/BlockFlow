@@ -9,6 +9,7 @@
 \usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
 \usepackage{xurl}
+\usepackage{bm}
 \usepackage{listings}
 \usepackage{fancyhdr}
 \usepackage{titlesec}
@@ -147,21 +148,19 @@ Let $b\ge1$ be the fixed commitment size. For left-to-right training, sample a r
 \end{equation}
 On the resulting context, construct Gaussian-to-data paths for \emph{every} $i\in\A_k$ using Equation~\eqref{eq:interpolant}, and optimize Equation~\eqref{eq:loss}. The context is teacher-forced clean target tokens during initial supervised training. It must not receive information from the unrevealed reference tokens via attention or cached hidden states.
 
-\paragraph{Preparation for Stage 2.}
-Left-to-right contexts alone create a train--inference mismatch for noncontiguous adaptive revelation. A planned augmentation samples \emph{fixed-size revelation sets} under random permutations: form $\C_k$ as the union of the first $k$ groups of size $b$ in a shuffled ordering; the loss remains over the full $\A_k$. Stage~1 still uses \emph{fixed-size commitment}; only the training context ordering is diversified. Compare LTR-only and mixed-context training as separate ablations. Do not silently assume this fixes all policy-induced distribution shift, especially because Stage~2 conditions on \emph{generated} committed tokens rather than gold ones.
 
 \begin{algorithm}[htbp]
-\caption{Stage 1 training: one supervised update (all remaining positions)}\label{alg:train}
+\caption{Stage 1 training}\label{alg:train}
 \begin{algorithmic}[1]
-\Require Clean $(s,y)$ including EOS, size $b$, generator $f_\theta$
-\State Choose LTR  revelation ordering
-\State Sample a nonterminal round $k$; obtain $\C_k$ and $\A_k$
-\State Sample $t\sim U(0,1)$ and $x_0^i\sim\N(0,I_V)$ for \textbf{all} $i\in\A_k$
-\State $z_t^i\gets(1-t)x_0^i+t e(y_i)$ for \textbf{all} $i\in\A_k$
-\State Build attention: clean source/context cannot attend any active position
+\Require The dataset $\mathcal{D}$, size $b$, denoiser $p_\theta$
+\State Choose left-to-right ordering.
+\State Sample $\bm{x} = [\bm{x}_1, \ldots, \bm{x}_{L}] \sim \mathcal{D}$
+\State For each step $k$; obtain $\C_k = \{1,\ldots, kb\}$ and $\A_k= \{kb+1, L\}$
+\State Sample $t\sim U(0,1)$ and $\bm{\epsilon}^i\sim\N(0,I_V)$ for \textbf{all} $i\in\A_k$
+\State $x_i(t)\gets(1-t)\bm{\epsilon}^i+t (\bm{x}_i)$ for \textbf{all} $i\in\A_k$
 \State Predict vocabulary distributions $p_\theta^i$ at all $i\in\A_k$
-\State $\ell\gets-|\A_k|^{-1}\sum_{i\in\A_k}\log p_\theta^i(y_i)$
-\State Update $\theta$ using $\nabla_\theta\ell$; exclude padding/context/source losses
+\State $\ell\gets-|\A_k|^{-1}\sum_{i\in\A_k}\log p_\theta^i(x_i\mid x_i(t), \bm{x}_{c})$
+\State Update $\theta$ using $\nabla_\theta\ell$.
 \end{algorithmic}
 \end{algorithm}
 
@@ -170,18 +169,20 @@ A \emph{complete flow solve} is performed for $\A_k$ on every round, from fresh 
 \begin{algorithm}[htbp]
 \caption{Stage 1 inference: all remaining flow, fixed commitment}\label{alg:infer}
 \begin{algorithmic}[1]
-\Require Source $s$, target canvas $\mathcal U$, commit size $b$, flow steps $T$
-\State $\C\gets\varnothing$; $\A\gets\mathcal U$; committed tokens $y_\C\gets\varnothing$
-\While{$\A\ne\varnothing$ and stopping/budget conditions permit}
-  \State Draw fresh Gaussian $z_0^i\sim\N(0,I_V)$ for \textbf{all} $i\in\A$
-  \State Solve conditional VFM flow on \textbf{all} $\A$ for $T$ evaluations
-  \State Decode candidate token IDs $\widehat y_i$ for \textbf{all} $i\in\A$
-  \State $\Sset\gets$ first $\min(b,|\A|)$ positions in $\A$ (fixed LTR)
-  \State Commit $y_i\gets\widehat y_i$ only for $i\in\Sset$
+\Require commit size $b$, flow steps $T$
+\State $\C\gets\varnothing$; committed tokens $\bm{x}_c\gets\varnothing$, $\A \gets \{1, \ldots,L \}$
+\While{$\A\ne\varnothing$}
+  \State Sample $\bm{x}_i(0)\sim\N(0,I_V)$ for \textbf{all} $i\in\A$
+  \State Update flow on \textbf{all} $\A$ for $T$ evaluations
+  \begin{align}
+      \nonumber \bm{x}_{i}(t + \Delta t) = \bm{x}_i(t) + \Delta t \frac{p_{\theta}(\bm{x}_i \mid \bm{x}_i(t), t, \bm{x}_c) - \bm{x}_i(t)}{1 - t}
+  \end{align}
+  \State Decode candidate token IDs $ \hat{\bm{x}}_i$ for \textbf{all} $i\in\A$
+  \State $\Sset\gets$$\min(b,|\A|)$ positions in $\A$ (fixed left to right)
+  \State Commit $\bm{x}_i\gets\hat{\bm{x}}_i$ only for $i\in\Sset$
   \State $\C\gets\C\cup\Sset$; $\A\gets\A\setminus\Sset$
-  \State Update clean-context representations; apply valid EOS rule
 \EndWhile
-\State \Return output determined from committed tokens and EOS convention
+\State \Return $\bm{x}(1)$
 \end{algorithmic}
 \end{algorithm}
 
