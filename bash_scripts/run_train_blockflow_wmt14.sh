@@ -6,7 +6,9 @@ cd "${REPO_ROOT}" || exit
 source "${REPO_ROOT}/setup_env.sh"
 
 NUM_VISIBLE_DEVICES="${NUM_VISIBLE_DEVICES:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
-RUN_DIR="${RUN_DIR:-${REPO_ROOT}/outputs}"
+# Checkpoints are large (~6GB each) and saved frequently; default to local
+# scratch (fast NVMe, not the NFS-mounted home dir) rather than REPO_ROOT/outputs.
+RUN_DIR="${RUN_DIR:-/scratch/${USER}/blockflow_outputs}"
 
 # Model arch (Adaptive BlockFlow Stage 1: Gaussian-to-categorical VFM, see
 # docs/mypapers/main.tex). `block_size` here is the spec's fixed commit size `b`.
