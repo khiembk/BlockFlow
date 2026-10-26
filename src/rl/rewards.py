@@ -48,12 +48,18 @@ def compute_reward(
     quality: float,
     cost: float,
     diversity: Optional[float] = None,
-    lambda_quality: float = 1.0,
     lambda_cost: float = 0.02,
     lambda_diversity: float = 0.0,
 ) -> float:
-    """Spec Eq.: R_g = lambda_q * Q_g + lambda_d * D_g - lambda_c * C_g."""
-    reward = lambda_quality * quality - lambda_cost * cost
+    """Spec Eq.: R_g = Q_g + lambda_d * D_g - lambda_c * C_g, where
+    Q_g = chrF(hyp, ref) / 100 (quality has no separate weight -- for WMT14
+    the spec sets lambda_d = 0 and considers only quality and cost).
+
+    `quality` is the raw sentence_quality() output (chrF in [0, 100]); the
+    /100 normalization to match Q_g happens here, not at the call site, so
+    callers can keep logging/reporting the raw chrF score.
+    """
+    reward = (quality / 100.0) - lambda_cost * cost
     if lambda_diversity > 0.0 and diversity is not None:
         reward += lambda_diversity * diversity
     return reward

@@ -103,7 +103,6 @@ def main(cfg: DictConfig) -> None:
                     quality=q,
                     cost=c,
                     diversity=d,
-                    lambda_quality=cfg.grpo.lambda_quality,
                     lambda_cost=cfg.grpo.lambda_cost,
                     lambda_diversity=cfg.grpo.lambda_diversity,
                 )

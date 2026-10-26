@@ -191,16 +191,14 @@ Round~0 flows over positions $1{:}12$, commits $1{:}3$; round~1 flows over $4{:}
 
 \section{Stage 2: GRPO for adaptive token revelation}
 \subsection{Policy state and action}
-Freeze $\theta$ initially. At reveal round $k$ the \emph{same} generator solves the flow over $\A_k$ and exposes candidate token IDs and endpoint probabilities. The policy observation $o_k$ may include:
+Freeze $\theta$ initially. At reveal round $k$ the \emph{same} generator solves the flow over $\A_k$ and exposes candidate token IDs and endpoint probabilities. The policy observation $o_k$ includes:
 \begin{equation}
-o_k=(h(s),\;\C_k,\;\A_k,\;\widehat y_{\A_k},\;\text{entropy}_{\A_k},\;
-\text{top-prob}_{\A_k},\;\text{margin}_{\A_k},\;k/K_{\max}).
+o_k=(h(s),\;\C_k,\;\A_k,\;\widehat x_{\A_k},\;\text{entropy}_{\A_k},\;
+p_{\theta}(\bm{x}_{i \in \A} \mid \bm{x}_{c})).
 \end{equation}
-Every feature must be computable \emph{without a reference translation} at inference. Policy features from generator hidden states are detached. Reference targets are used only to calculate training-time reward.
-
-The policy samples a \emph{nonempty subset} $\Sset_k\subseteq\A_k$, and its size $m_k=|\Sset_k|$ is adaptive. A convenient implementable factorization is
+Policy features from generator hidden states are detached. Reference targets are used only to calculate training-time reward. The policy samples a \emph{nonempty subset} $\Sset_k\subseteq\A_k$, and its size $m_k=|\Sset_k|$ is adaptive. A convenient implementable factorization is
 \begin{align}
- m_k&\sim p_\phi(m\mid o_k),\quad 1\le m\le\min(m_{\max},|\A_k|),\\
+ m_k&\sim p_\phi(m\mid o_k),\quad 1\le m\le |\A_{k}|,\\
  (i_1,\ldots,i_{m_k})&\sim \prod_{r=1}^{m_k}p_\phi(i_r\mid o_k,m_k,i_{<r}),
 \qquad i_r\in\A_k\setminus\{i_1,\ldots,i_{r-1}\}.\label{eq:act}
 \end{align}
@@ -214,15 +212,28 @@ No duplicate selection is possible. If the policy is defined over \emph{unordere
 \subsection{Rewards: quality, diversity, computational cost}
 Let $\tau_g$ denote one complete rollout for a German source $s$, producing English output $\widehat y_g$. Use a group of $G\ge2$ independent rollouts for the \emph{same} source. Set
 \begin{equation}
-\boxed{R_g=\lambda_q Q_g+\lambda_d D_g-\lambda_c C_g,}\label{eq:reward}
+\boxed{R_g= Q_g+\lambda_d D_g-\lambda_c C_g,}\label{eq:reward}
 \end{equation}
-with explicit calibration of reward scales:
+\textbf{For the WMT14 task}. Set $\lambda_{d} = 0$, donot consider the diversity reward.
 \begin{itemize}
-\item \textbf{Quality $Q_g$:} smoothed sentence chrF or BLEU against the reference target; report corpus BLEU/chrF for final evaluation. chrF is a reasonable first training signal because it is less brittle than sentence-level BLEU.
-\item \textbf{Cost $C_g$:} actual generator network calls $\NFE(\tau_g)/N_{\rm ref}$, with clean-context cache rebuilds and all other model evaluations separately counted; also record latency. If the flow always uses $T$ evaluations per revelation round, a first-order approximation is $\NFE(\tau_g)\simeq K_gT$, not a guarantee.
-\item \textbf{Optional diversity $D_g$:} compare \emph{different translations of the same source}, not distinct positions in one output. For instance, $D_g=(G-1)^{-1}\sum_{h\ne g} [1-\mathrm{chrF}(\widehat y_g,\widehat y_h)/100]$, gated by a minimum translation-quality threshold. Otherwise the policy may obtain diversity reward by producing incorrect translations.
+\item \textbf{Quality $Q_g$:}
+    Measure translation accuracy using sentence-level chrF:
+    \[
+    Q_g = \frac{\mathrm{chrF}(\widehat{\bm{y}}_g,\bm{y})}{100},
+    \]
+    where $\bm{y}$ is the reference translation.
+
+    \item \textbf{Computational cost $C_g$:}
+    Penalize the number of function evaluations (NFE),
+    i.e., the number of generator forward passes:
+    \[
+    C_g = \frac{\mathrm{NFE}(\tau_g)}{N_{\mathrm{ref}}}.
+    \]
+    If each revelation round requires $T$ model evaluations,
+    then $\mathrm{NFE}(\tau_g)=K_gT$, where $K_g$ is the
+    number of revelation rounds.
 \end{itemize}
-Because diversity couples group members, the naive independent-trajectory GRPO surrogate is an approximation to the gradient of a group-coupled reward; this should be presented as a proposed heuristic and ablated. The safest initial result uses $\lambda_d=0$ and adds diversity only after quality and cost are stable. For WMT14 there may be multiple acceptable translations but only one reference; quality metrics need careful interpretation.
+
 
 \subsection{Group-relative policy optimization}
 For each source, obtain $G$ rollouts under a frozen old controller $\pi_{\rm old}$. For terminal rewards $R_1,\ldots,R_G$ compute
