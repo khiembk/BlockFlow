@@ -18,7 +18,16 @@ EVAL_BLOCK_SIZE=${BLOCK_SIZE}
 HIDDEN_SIZE=768
 N_LAYERS=12
 N_HEADS=12
-VOCAB_SIZE=119547  # bert-base-multilingual-cased vocab size
+# Default to a de/en-scoped ~32k vocab (T5-small's tokenizer, same choice as the
+# sibling CorrFlow/ELF-B project) rather than bert-base-multilingual-cased's
+# 119547 (spread across 100+ languages we don't need): smaller dense (L,V)
+# buffers -> bigger batches, and less wasted output-space capacity.
+# NOTE: VOCAB_SIZE must equal len(tokenizer) *after* maybe_add_missing_special_tokens
+# (which may add one token, e.g. T5-small: raw vocab_size=32100 -> len=32101),
+# not the tokenizer's raw `.vocab_size` -- verify with scripts/utils.py if you
+# change TOKENIZER_NAME.
+TOKENIZER_NAME="${TOKENIZER_NAME:-t5-small}"
+VOCAB_SIZE="${VOCAB_SIZE:-32101}"
 ATTN_BACKEND=sdpa
 
 # Hyperparameters
@@ -31,7 +40,7 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-2000ba}"
 
 PRETRAINED_MODEL_NAME_OR_PATH=null
 
-TAG="blockflow_vfm_stage1_v1"
+TAG="blockflow_vfm_stage1_v2_t5vocab"
 LAYERS="layers${N_LAYERS}"
 RUN_NAME=wmt14_commit${BLOCK_SIZE}_lr${LR}_bsz${BATCH_SIZE}_warm${WARMUP_DURATION}_${LAYERS}_hidden${HIDDEN_SIZE}_${TAG}
 
@@ -58,7 +67,7 @@ composer -n ${NUM_VISIBLE_DEVICES} scripts/composer_scripts/train_discrete_denoi
   run_name=${RUN_NAME} \
   pretrained_model_name_or_path=${PRETRAINED_MODEL_NAME_OR_PATH} \
   tokenizer=autotokenizer \
-  tokenizer.pretrained_model_name_or_path=bert-base-multilingual-cased \
+  tokenizer.pretrained_model_name_or_path=${TOKENIZER_NAME} \
   collator=blockflow \
   collator@eval_collator=blockflow \
   dataset@train_dataset=wmt14_train \
