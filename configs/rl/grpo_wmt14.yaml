@@ -1,0 +1,62 @@
+# Stage 2: GRPO adaptive token-revelation policy training (spec Milestone M4).
+# The generator (theta) is frozen and loaded from a Stage-1 AdaptiveBlockFlow
+# checkpoint; only the policy (phi) is trained. See scripts/rl/train_grpo_revelation.py.
+
+run_name: ???
+seed: 1
+output_dir: ${cwd:}/outputs/grpo/${run_name}
+
+generator:
+  pretrained_model_name_or_path: ???  # path to a Stage-1 run dir (has config.yaml)
+  ckpt_file: "latest-rank0.pt"
+  load_ema_weights: false
+
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: bert-base-multilingual-cased
+
+dataset:
+  _target_: src.datasets.tokenize_on_demand.WMTDataset
+  split: "train"
+  dataset_path: "wmt14"
+  config_name: "de-en"
+  source_lang: "de"
+  target_lang: "en"
+  max_source_length: 96
+  max_target_length: 96
+  add_special_tokens: true
+  truncate: true
+  separate_input_output: true
+
+policy:
+  hidden_dim: ???  # must match the generator backbone's hidden_size
+  mlp_hidden: 128
+  m_max: 16
+
+grpo:
+  group_size: 4  # G: rollouts per source
+  sources_per_step: 4
+  num_steps: 1000
+  grpo_epochs: 1
+  clip_eps: 0.2
+  policy_lr: 3e-4
+  max_grad_norm: 1.0
+  lambda_quality: 1.0
+  lambda_cost: 0.02
+  lambda_diversity: 0.0
+
+generation:
+  max_new_tokens: 64
+  num_flow_steps: 16
+  policy_max_rounds: 40
+  do_sample: true
+
+logging:
+  log_interval: 10
+  save_interval: 100
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: true

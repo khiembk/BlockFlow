@@ -7,7 +7,7 @@ generation) only. No KV-caching (M3) or GRPO (M4) is implemented here.
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,7 @@ from src.denoiser.base import (
     DenoiserInput,
     LossAndNllOutput,
 )
+from src.rl.policy import RevelationPolicy
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,32 @@ class BlockFlowGenerationOutput(ModelOutput):
     sequences: Optional[torch.LongTensor] = None
     nfe: Optional[int] = None
     num_rounds: Optional[int] = None
+
+
+@dataclass
+class RolloutStep:
+    """One revelation round of a Stage-2 GRPO rollout (spec Section "Stage 2:
+    Policy state and action"). Observation tensors are detached (generator theta
+    is frozen; policy features never backprop into it)."""
+
+    position_features: torch.Tensor  # (1, L, hidden_dim + 4), detached
+    global_features: torch.Tensor  # (1, hidden_dim + 1), detached
+    active_mask: torch.BoolTensor  # (1, L), detached
+    m_max_eff: int
+    action: Dict[str, Any]  # {"m": int, "indices": LongTensor, "log_prob": Tensor|None}
+    is_forced: bool  # True if this round's commitment was a forced-budget action
+    # (spec: "Forced last-round actions must be deterministic and excluded from
+    # the stochastic policy loss") rather than a stochastic policy sample.
+
+
+@dataclass
+class RolloutTrace:
+    """Full Stage-2 rollout trajectory for one source, used by GRPO."""
+
+    steps: list[RolloutStep]
+    sequence: torch.LongTensor
+    total_nfe: int
+    num_rounds: int
 
 
 class AdaptiveBlockFlowConfig(DenoiserConfig):
@@ -232,6 +259,68 @@ class AdaptiveBlockFlow(Denoiser):
     # ------------------------------------------------------------------
     # Generation (spec Algorithm 2: all-remaining flow, fixed commitment, uncached)
     # ------------------------------------------------------------------
+    def _solve_flow_round(
+        self,
+        sequence: torch.LongTensor,
+        committed_mask: torch.BoolTensor,
+        attention_mask_valid: torch.BoolTensor,
+        canvas_length: int,
+        position_idx: torch.LongTensor,
+        num_flow_steps: int,
+        request_hidden_states: bool = False,
+    ) -> tuple[torch.Tensor, torch.BoolTensor, Optional[torch.Tensor], int]:
+        """Solve the Gaussian-to-categorical flow over all active positions for one
+        revelation round (spec Algorithm 2, inner loop / Eq. 4 Euler sampler).
+
+        Shared by both `generate` (fixed-`b` commitment) and `rollout_for_grpo`
+        (policy-driven commitment) so there is exactly one tested implementation
+        of "solve the flow over everything not yet committed."
+
+        Returns `(p_theta, active_mask, hidden_state, nfe)`, where `hidden_state`
+        is the backbone's final pre-output-layer representation from the last
+        Euler step (only computed/returned if `request_hidden_states=True`).
+        """
+        device = sequence.device
+        active_mask = (~committed_mask) & attention_mask_valid
+        clean_mask = committed_mask & attention_mask_valid
+        bool_mask = self._build_attention_mask(
+            clean_mask=clean_mask, active_mask=active_mask, position_idx=position_idx
+        )
+        bool_mask = bool_mask & attention_mask_valid[:, None, :]
+        float_mask = self._preprocess_attention_mask(
+            bool_mask[:, None, :, :], dtype=torch.float32
+        )
+
+        z = torch.randn(1, canvas_length, self.vocab_size, device=device)
+        timesteps = torch.linspace(0.0, 1.0, num_flow_steps + 1, device=device)
+        p_theta = None
+        hidden_state = None
+        nfe = 0
+        for step in range(num_flow_steps):
+            t_cur = timesteps[step].expand(1)
+            t_next = timesteps[step + 1]
+            is_last_step = step == num_flow_steps - 1
+            backbone_output = self._backbone_forward(
+                DenoiserInput(
+                    xt=sequence,
+                    continuous_states=z,
+                    active_mask=active_mask,
+                    attention_mask=float_mask,
+                    backbone_kwargs={"position_ids": position_idx, "t": t_cur},
+                ),
+                output_hidden_states=(request_hidden_states and is_last_step),
+            )
+            nfe += 1
+            logits = getattr(backbone_output, "logits", backbone_output)
+            p_theta = logits.softmax(dim=-1)
+            if request_hidden_states and is_last_step:
+                hidden_state = backbone_output.hidden_states[0]
+            velocity = (p_theta - z) / (1.0 - t_cur)
+            z_new = z + (t_next - t_cur) * velocity
+            z = torch.where(active_mask[..., None], z_new, z)
+
+        return p_theta, active_mask, hidden_state, nfe
+
     @torch.inference_mode()
     def generate(
         self,
@@ -278,39 +367,17 @@ class AdaptiveBlockFlow(Denoiser):
         finished = False
         while committed_mask[:, input_length:].sum() < max_new_tokens and not finished:
             active_mask = (~committed_mask) & attention_mask_valid
-            num_active = int(active_mask.sum().item())
-            if num_active == 0:
+            if int(active_mask.sum().item()) == 0:
                 break
-            clean_mask = committed_mask & attention_mask_valid
-            bool_mask = self._build_attention_mask(
-                clean_mask=clean_mask, active_mask=active_mask, position_idx=position_idx
+            p_theta, active_mask, _, nfe = self._solve_flow_round(
+                sequence=sequence,
+                committed_mask=committed_mask,
+                attention_mask_valid=attention_mask_valid,
+                canvas_length=canvas_length,
+                position_idx=position_idx,
+                num_flow_steps=num_flow_steps,
             )
-            bool_mask = bool_mask & attention_mask_valid[:, None, :]
-            float_mask = self._preprocess_attention_mask(
-                bool_mask[:, None, :, :], dtype=torch.float32
-            )
-
-            z = torch.randn(1, canvas_length, self.vocab_size, device=device)
-            timesteps = torch.linspace(0.0, 1.0, num_flow_steps + 1, device=device)
-            p_theta = None
-            for step in range(num_flow_steps):
-                t_cur = timesteps[step].expand(1)
-                t_next = timesteps[step + 1]
-                backbone_output = self._backbone_forward(
-                    DenoiserInput(
-                        xt=sequence,
-                        continuous_states=z,
-                        active_mask=active_mask,
-                        attention_mask=float_mask,
-                        backbone_kwargs={"position_ids": position_idx, "t": t_cur},
-                    )
-                )
-                total_nfe += 1
-                logits = getattr(backbone_output, "logits", backbone_output)
-                p_theta = logits.softmax(dim=-1)
-                velocity = (p_theta - z) / (1.0 - t_cur)
-                z_new = z + (t_next - t_cur) * velocity
-                z = torch.where(active_mask[..., None], z_new, z)
+            total_nfe += nfe
 
             candidate_ids = self._sample_categorical(p_theta, do_sample=do_sample)
             active_positions = active_mask[0].nonzero(as_tuple=True)[0]
@@ -335,3 +402,166 @@ class AdaptiveBlockFlow(Denoiser):
                 sequences=sequence, nfe=total_nfe, num_rounds=num_rounds
             )
         return sequence
+
+    # ------------------------------------------------------------------
+    # Stage 2: policy-driven rollout for GRPO (spec Algorithm 3, rollout half)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_observation(
+        p_theta: torch.Tensor,
+        hidden_state: torch.Tensor,
+        active_mask: torch.BoolTensor,
+        clean_mask: torch.BoolTensor,
+        position_idx: torch.LongTensor,
+        canvas_length: int,
+        round_frac: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Builds reference-free policy features (spec Section "Stage 2: Policy
+        state and action", Eq. o_k): per-position [hidden, entropy, top_prob,
+        margin, position_frac] and a pooled-source global feature. Everything is
+        detached — the frozen generator never receives policy gradients."""
+        probs = p_theta.detach()
+        hidden = hidden_state.detach()
+        top2 = probs.topk(k=min(2, probs.shape[-1]), dim=-1).values
+        top_prob = top2[..., 0]
+        second_prob = top2[..., -1] if top2.shape[-1] > 1 else torch.zeros_like(top_prob)
+        margin = top_prob - second_prob
+        entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
+        position_frac = (position_idx.to(hidden.dtype) / float(canvas_length))
+        position_features = torch.cat(
+            [
+                hidden,
+                entropy[..., None],
+                top_prob[..., None],
+                margin[..., None],
+                position_frac[..., None],
+            ],
+            dim=-1,
+        )
+        clean_f = clean_mask[..., None].to(hidden.dtype)
+        pooled_hidden = (hidden * clean_f).sum(dim=1) / clean_f.sum(dim=1).clamp_min(1.0)
+        round_frac_t = torch.full(
+            (hidden.shape[0], 1), round_frac, device=hidden.device, dtype=hidden.dtype
+        )
+        global_features = torch.cat([pooled_hidden, round_frac_t], dim=-1)
+        return position_features, global_features
+
+    @torch.no_grad()
+    def rollout_for_grpo(
+        self,
+        inputs: torch.LongTensor,
+        policy: RevelationPolicy,
+        max_new_tokens: int,
+        num_flow_steps: int = 16,
+        policy_max_rounds: int = 40,
+        do_sample: bool = True,
+        attention_mask: Optional[torch.LongTensor] = None,
+    ) -> RolloutTrace:
+        """Runs one policy-driven rollout (spec Algorithm 3's rollout half): each
+        round solves the flow over all active positions (shared `_solve_flow_round`
+        with Stage 1's `generate`), then the policy chooses how many and which
+        positions to commit instead of a fixed `commit_size`. Generator `theta` is
+        frozen throughout (no_grad); only observation tensors (detached) and the
+        sampled action/log-prob are recorded for the later GRPO update, which
+        back-propagates through `policy` only.
+        """
+        assert inputs.shape[0] == 1, "Only batch size 1 is supported for rollouts."
+        device = inputs.device
+        input_length = inputs.shape[-1]
+        canvas_length = input_length + max_new_tokens
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(inputs)
+        attention_mask_valid = torch.cat(
+            [
+                attention_mask.bool(),
+                torch.ones(1, max_new_tokens, dtype=torch.bool, device=device),
+            ],
+            dim=-1,
+        )
+        sequence = torch.cat(
+            [inputs, torch.zeros(1, max_new_tokens, dtype=torch.long, device=device)],
+            dim=-1,
+        )
+        committed_mask = torch.cat(
+            [
+                torch.ones_like(inputs, dtype=torch.bool),
+                torch.zeros(1, max_new_tokens, dtype=torch.bool, device=device),
+            ],
+            dim=-1,
+        )
+        position_idx = torch.arange(canvas_length, device=device)[None, :]
+
+        steps: list[RolloutStep] = []
+        total_nfe = 0
+        round_idx = 0
+        finished = False
+        while committed_mask[:, input_length:].sum() < max_new_tokens and not finished:
+            active_mask = (~committed_mask) & attention_mask_valid
+            num_active = int(active_mask.sum().item())
+            if num_active == 0:
+                break
+            clean_mask = committed_mask & attention_mask_valid
+
+            p_theta, active_mask, hidden_state, nfe = self._solve_flow_round(
+                sequence=sequence,
+                committed_mask=committed_mask,
+                attention_mask_valid=attention_mask_valid,
+                canvas_length=canvas_length,
+                position_idx=position_idx,
+                num_flow_steps=num_flow_steps,
+                request_hidden_states=True,
+            )
+            total_nfe += nfe
+
+            position_features, global_features = self._build_observation(
+                p_theta=p_theta,
+                hidden_state=hidden_state,
+                active_mask=active_mask,
+                clean_mask=clean_mask,
+                position_idx=position_idx,
+                canvas_length=canvas_length,
+                round_frac=round_idx / max(1, policy_max_rounds),
+            )
+
+            is_forced = round_idx >= policy_max_rounds - 1
+            if is_forced:
+                active_positions = active_mask[0].nonzero(as_tuple=True)[0]
+                action = {"m": num_active, "indices": active_positions, "log_prob": None}
+                m_max_eff = num_active
+            else:
+                m_max_eff = min(policy.m_max, num_active)
+                action = policy.sample_action(
+                    position_features=position_features,
+                    global_features=global_features,
+                    active_mask=active_mask,
+                    m_max_eff=m_max_eff,
+                )
+
+            candidate_ids = self._sample_categorical(p_theta, do_sample=do_sample)
+            commit_positions = action["indices"]
+            sequence[0, commit_positions] = candidate_ids[0, commit_positions]
+            committed_mask[0, commit_positions] = True
+            steps.append(
+                RolloutStep(
+                    position_features=position_features,
+                    global_features=global_features,
+                    active_mask=active_mask,
+                    m_max_eff=m_max_eff,
+                    action=action,
+                    is_forced=is_forced,
+                )
+            )
+            round_idx += 1
+
+            if self.eos_token_id is not None:
+                committed_ids = sequence[0, commit_positions]
+                eos_hits = (committed_ids == self.eos_token_id).nonzero(as_tuple=True)[0]
+                if eos_hits.numel() > 0:
+                    eos_pos = commit_positions[eos_hits[0]].item()
+                    sequence = sequence[:, : eos_pos + 1]
+                    finished = True
+
+        return RolloutTrace(
+            steps=steps, sequence=sequence, total_nfe=total_nfe, num_rounds=round_idx
+        )

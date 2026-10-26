@@ -66,6 +66,7 @@ class ContinuousDIT(DIT):
         attention_mask: Optional[torch.FloatTensor] = None,
         t: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        output_hidden_states: bool = False,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
         del kwargs  # No KV-cache / legacy-signature kwargs are supported here.
@@ -94,4 +95,7 @@ class ContinuousDIT(DIT):
                 use_cache=False,
             )
         logits = self.output_layer(x, t_cond)
-        return CausalLMOutputWithPast(logits=logits, past_key_values=None)
+        hidden_states = (x,) if output_hidden_states else None
+        return CausalLMOutputWithPast(
+            logits=logits, past_key_values=None, hidden_states=hidden_states
+        )

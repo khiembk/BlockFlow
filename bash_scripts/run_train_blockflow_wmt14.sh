@@ -23,7 +23,9 @@ ATTN_BACKEND=sdpa
 LR=3e-4
 WARMUP_DURATION="2500ba"
 BATCH_SIZE=256
-MAX_DURATION="200000ba"
+MAX_DURATION="${MAX_DURATION:-200000ba}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-5000ba}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-2000ba}"
 
 PRETRAINED_MODEL_NAME_OR_PATH=null
 
@@ -38,7 +40,9 @@ RUN_NAME=wmt14_commit${BLOCK_SIZE}_lr${LR}_bsz${BATCH_SIZE}_warm${WARMUP_DURATIO
 # micro-batch size here is much smaller than other bash_scripts/ use at this
 # hidden size.
 GPU_TYPE=$(nvidia-smi --query-gpu=name --format=csv,noheader | sed -E 's/.*(A[0-9]+|H100|A6000).*/\1/' | head -n 1)
-if [[ "$GPU_TYPE" == "A100" || "$GPU_TYPE" == "H100" ]]; then
+if [[ -n "${MICRO_BATCH_SIZE:-}" ]]; then
+    : # explicit override wins
+elif [[ "$GPU_TYPE" == "A100" || "$GPU_TYPE" == "H100" ]]; then
     MICRO_BATCH_SIZE=8
 elif [[ "$GPU_TYPE" == "A6000" ]]; then
     MICRO_BATCH_SIZE=4
@@ -58,7 +62,7 @@ composer -n ${NUM_VISIBLE_DEVICES} scripts/composer_scripts/train_discrete_denoi
   dataset@train_dataset=wmt14_train \
   dataset@eval_dataset=wmt14_eval \
   composer.optimizer.lr=${LR} \
-  composer.trainer.eval_interval="2000ba" \
+  composer.trainer.eval_interval=${EVAL_INTERVAL} \
   composer.trainer.max_duration=${MAX_DURATION} \
   composer.trainer.save_num_checkpoints_to_keep=1 \
   composer/lr_scheduler=constant_with_warmup \
@@ -80,7 +84,7 @@ composer -n ${NUM_VISIBLE_DEVICES} scripts/composer_scripts/train_discrete_denoi
   eval_block_size=${EVAL_BLOCK_SIZE} \
   training.antithetic_sampling=false \
   hydra.run.dir=${RUN_DIR}/${RUN_NAME} \
-  composer.trainer.save_interval="5000ba" \
+  composer.trainer.save_interval=${SAVE_INTERVAL} \
   composer.loggers.name=${RUN_NAME} \
   train_dataloader.num_workers=${NUM_WORKERS} \
   composer.callbacks.hf_compatible_checkpointing.disable_hf=true
