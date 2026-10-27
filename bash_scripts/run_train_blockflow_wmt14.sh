@@ -18,10 +18,14 @@ LENGTH=200
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
 EVAL_BLOCK_SIZE=${BLOCK_SIZE}
 # hidden_size is free now (no longer forced to equal T5's 512-dim output) --
-# the trainable BottleneckAdapter bridges T5's space to this width.
-HIDDEN_SIZE="${HIDDEN_SIZE:-512}"
+# the trainable BottleneckAdapter bridges T5's space to this width. Sized to
+# match ELF-B (ELF's own base config for this exact WMT14 de-en task: depth=12,
+# hidden_size=768, num_heads=12, mlp_ratio=4.0 -- see ELF's src/modules/model.py
+# and src/configs/training_configs/train_de-en_ELF-B.yml), which lands our
+# trainable param count at ~97M (measured: 97.2M trainable / 132.5M total).
+HIDDEN_SIZE="${HIDDEN_SIZE:-768}"
 N_LAYERS=12
-N_HEADS="${N_HEADS:-8}"
+N_HEADS="${N_HEADS:-12}"
 BOTTLENECK_DIM="${BOTTLENECK_DIM:-128}"
 T5_MODEL_NAME="${T5_MODEL_NAME:-t5-small}"
 T5_EMBED_DIM="${T5_EMBED_DIM:-512}"
