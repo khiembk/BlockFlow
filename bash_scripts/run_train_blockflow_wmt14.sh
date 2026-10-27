@@ -15,9 +15,13 @@ RUN_DIR="${RUN_DIR:-/scratch/${USER}/blockflow_outputs}"
 LENGTH=200
 BLOCK_SIZE="${BLOCK_SIZE:-8}"
 EVAL_BLOCK_SIZE=${BLOCK_SIZE}
-HIDDEN_SIZE=768
+# hidden_size=512/n_heads=8 matches t5-small's own d_model/head-count exactly --
+# required (not just convenient) when PRETRAINED_EMBEDDING_MODEL is set, since
+# vocab_embed/output_layer are initialized directly from t5-small's embedding
+# table with no projection layer bridging a dimension mismatch.
+HIDDEN_SIZE="${HIDDEN_SIZE:-512}"
 N_LAYERS=12
-N_HEADS=12
+N_HEADS="${N_HEADS:-8}"
 # Default to a de/en-scoped ~32k vocab (T5-small's tokenizer, same choice as the
 # sibling CorrFlow/ELF-B project) rather than bert-base-multilingual-cased's
 # 119547 (spread across 100+ languages we don't need): smaller dense (L,V)
@@ -28,6 +32,9 @@ N_HEADS=12
 # change TOKENIZER_NAME.
 TOKENIZER_NAME="${TOKENIZER_NAME:-t5-small}"
 VOCAB_SIZE="${VOCAB_SIZE:-32101}"
+# Initialize + freeze vocab_embed/output_layer from this pretrained model's
+# token embeddings (e.g. "t5-small"); null disables this (random init, as before).
+PRETRAINED_EMBEDDING_MODEL="${PRETRAINED_EMBEDDING_MODEL:-t5-small}"
 ATTN_BACKEND=sdpa
 
 # Hyperparameters
@@ -40,7 +47,7 @@ EVAL_INTERVAL="${EVAL_INTERVAL:-2000ba}"
 
 PRETRAINED_MODEL_NAME_OR_PATH=null
 
-TAG="blockflow_vfm_stage1_v2_t5vocab"
+TAG="blockflow_vfm_stage1_v3_t5embed"
 LAYERS="layers${N_LAYERS}"
 RUN_NAME=wmt14_commit${BLOCK_SIZE}_lr${LR}_bsz${BATCH_SIZE}_warm${WARMUP_DURATION}_${LAYERS}_hidden${HIDDEN_SIZE}_${TAG}
 
@@ -88,6 +95,7 @@ composer -n ${NUM_VISIBLE_DEVICES} scripts/composer_scripts/train_discrete_denoi
   model.config.backbone_config.n_heads=${N_HEADS} \
   model.config.backbone_config.vocab_size=${VOCAB_SIZE} \
   model.config.backbone_config.attn_backend=${ATTN_BACKEND} \
+  model.config.backbone_config.pretrained_embedding_model=${PRETRAINED_EMBEDDING_MODEL} \
   training.global_batch_size=${BATCH_SIZE} \
   training.grad_accum=$(( BATCH_SIZE / NUM_VISIBLE_DEVICES / MICRO_BATCH_SIZE )) \
   eval_dataloader.batch_size=${MICRO_BATCH_SIZE} \

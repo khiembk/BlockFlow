@@ -50,13 +50,96 @@ class ContinuousDIT(DIT):
     KV-caching (M3) is implemented.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any):
+    def __init__(
+        self,
+        *args: Any,
+        pretrained_embedding_model: Optional[str] = None,
+        freeze_pretrained_embeddings: bool = True,
+        **kwargs: Any,
+    ):
         super().__init__(*args, **kwargs)
         if not self.adaLN:
             raise ValueError("ContinuousDIT requires adaln=true for time conditioning.")
         self.continuous_embed = ContinuousEmbedding(
             dim=self.vocab_embed.embedding.shape[1], vocab_dim=self.vocab_size
         )
+        if pretrained_embedding_model is not None:
+            self._init_pretrained_token_embeddings(
+                pretrained_embedding_model, freeze=freeze_pretrained_embeddings
+            )
+
+    def _init_pretrained_token_embeddings(
+        self, pretrained_model_name: str, freeze: bool = True
+    ) -> None:
+        """Initializes `vocab_embed` (clean-token lookup) and `output_layer`'s
+        projection from a pretrained model's token embedding table (e.g.
+        T5-small), instead of random init. Only the vocab-tied matrices are
+        affected -- `continuous_embed` (the active-position continuous-input
+        projection) and the transformer body have no pretrained equivalent and
+        are left as-is.
+
+        Requires `hidden_size` to exactly equal the pretrained model's
+        embedding dimension (e.g. 512 for t5-small) -- there is no learned
+        projection bridging a dimension mismatch here, by design (freezing a
+        projected pretrained embedding would just be training a new random
+        projection anyway).
+        """
+        from transformers import T5EncoderModel
+
+        log.info(
+            "Initializing vocab_embed/output_layer from pretrained '%s' token embeddings",
+            pretrained_model_name,
+        )
+        pretrained = T5EncoderModel.from_pretrained(pretrained_model_name)
+        embedding = pretrained.shared.weight.detach()
+        hidden_dim = self.vocab_embed.embedding.shape[1]
+        if embedding.shape[1] != hidden_dim:
+            raise ValueError(
+                f"hidden_size={hidden_dim} must equal the pretrained model's "
+                f"embedding dim={embedding.shape[1]} (e.g. 512 for t5-small) "
+                "to reuse its token embeddings directly."
+            )
+        if embedding.shape[0] < self.vocab_size:
+            raise ValueError(
+                f"Pretrained embedding table has {embedding.shape[0]} rows, "
+                f"fewer than our vocab_size={self.vocab_size}."
+            )
+        embedding = embedding[: self.vocab_size].to(
+            dtype=self.vocab_embed.embedding.dtype
+        )
+        # T5's raw embedding table has a *much* larger absolute scale than this
+        # architecture's own conventions (observed row-norm mean ~520 for
+        # t5-small, vs. ~0.58 for this backbone's default EmbeddingLayer init).
+        # That scale is only well-behaved inside T5's own co-designed stack
+        # (its own attention/LayerNorm scaling, no absolute position embeddings,
+        # tied-weight model_dim**-0.5 output correction); copying it as-is into a
+        # differently-scaled architecture (rotary attention, AdaLN, standard SDPA
+        # scaling) produced loss in the thousands, and even applying T5's own
+        # model_dim**-0.5 correction alone still left large logit spread (row
+        # norms ~23). So: unit-normalize each row first (preserving the directions
+        # / cosine similarities -- the actual transferred semantic information --
+        # while discarding T5's absolute scale), then apply a target scale
+        # appropriate for *this* architecture's conventions.
+        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+        with torch.no_grad():
+            # Input lookup: unit-norm rows is a reasonable embedding-layer scale
+            # on its own (comparable order of magnitude to many trained embedding
+            # tables), and the first LayerNorm in each transformer block
+            # renormalizes activations regardless.
+            self.vocab_embed.embedding.copy_(embedding)
+            # Output projection: DDiTFinalLayer.linear is zero-initialized by
+            # default (so initial predictions are exactly uniform); replacing it
+            # with unit-norm rows scaled by hidden_dim**-0.5 keeps logits small
+            # (empirically: std ~0.04 for hidden_dim=512) so initial predictions
+            # stay close to uniform while still encoding the pretrained token
+            # geometry, rather than reintroducing a large, unstable logit spread.
+            self.output_layer.linear.weight.copy_(embedding * (hidden_dim**-0.5))
+            self.output_layer.linear.bias.zero_()
+        del pretrained
+        if freeze:
+            self.vocab_embed.embedding.requires_grad_(False)
+            self.output_layer.linear.weight.requires_grad_(False)
+            self.output_layer.linear.bias.requires_grad_(False)
 
     def forward(
         self,
