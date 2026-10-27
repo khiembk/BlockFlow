@@ -68,11 +68,13 @@ class AdaptiveBlockFlowConfig(DenoiserConfig):
         self,
         commit_size: int = 1,
         sampling_eps: float = 1e-3,
+        window_size: Optional[int] = None,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.commit_size = commit_size
         self.sampling_eps = sampling_eps
+        self.window_size = window_size
 
 
 class AdaptiveBlockFlow(Denoiser):
@@ -86,6 +88,18 @@ class AdaptiveBlockFlow(Denoiser):
     `commit_size` (`b`, spec Section 5.1). `generate` performs a full, uncached
     flow solve over all remaining positions each round and commits only `b` of
     them (spec Algorithm 2).
+
+    `window_size` (optional) bounds what the *loss* scores to the nearest
+    `window_size` active positions in canvas order, instead of every active
+    position (which can be nearly the full remaining target length in early
+    rounds). This doesn't change the round/commit mechanics, the attention
+    contract, or the continuous interpolant at all -- every active position is
+    still given an interpolant and attended to exactly as before, so there is
+    no risk of degenerate all-masked attention rows. It only concentrates
+    gradient signal on the near-term positions that actually get committed
+    soon, matching this repo's BD3LM/SetDLM configs, which denoise a bounded
+    8-16 token unit per step rather than an unbounded remaining span.
+    `window_size=None` (default) preserves scoring every active position.
     """
 
     config_class = AdaptiveBlockFlowConfig
@@ -99,6 +113,16 @@ class AdaptiveBlockFlow(Denoiser):
         super().__init__(config, tokenizer, **kwargs)
         self.commit_size = config.commit_size
         self.sampling_eps = config.sampling_eps
+        self.window_size = config.window_size
+
+    def _window_tokens_mask(self, active_mask: torch.BoolTensor) -> torch.FloatTensor:
+        """Restricts the scored (loss) positions to the nearest `window_size`
+        active positions in canvas order. See class docstring."""
+        if self.window_size is None:
+            return active_mask.to(torch.float32)
+        active_rank = torch.cumsum(active_mask.to(torch.long), dim=-1) - 1
+        windowed = active_mask & (active_rank < self.window_size)
+        return windowed.to(torch.float32)
 
     # ------------------------------------------------------------------
     # Training
@@ -210,7 +234,7 @@ class AdaptiveBlockFlow(Denoiser):
             bool_mask[:, None, :, :], dtype=torch.float32
         )
 
-        tokens_mask = active_mask.to(torch.float32)
+        tokens_mask = self._window_tokens_mask(active_mask)
 
         return DenoiserInput(
             xt=input_ids,

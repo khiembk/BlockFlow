@@ -26,6 +26,7 @@ __all__ = [
     "SaveBestCheckpointing",
     "LogGradientNorms",
     "LogGradientVariance",
+    "BLEUEvalCallback",
 ]
 
 
@@ -610,3 +611,140 @@ class LogGradientVariance(Callback):
                 metrics["grad_stats/n_outliers"] = n_outliers
 
         return metrics
+
+
+class BLEUEvalCallback(Callback):
+    """Periodically runs real `generate()` (not teacher-forced) + corpus
+    BLEU/chrF on a small WMT14 validation slice, logged alongside the usual
+    forward-pass loss/perplexity eval.
+
+    Motivation: for AdaptiveBlockFlow's round-wise commit generation, teacher-
+    forced eval loss/perplexity does not reliably track actual generation
+    quality -- a live training run showed eval perplexity improve ~40x while
+    BLEU/chrF got *worse*, because teacher-forced loss only ever conditions on
+    the true committed context, never the model's own (possibly imperfect)
+    prior-round commits that `generate()` actually produces. BLEU/chrF here
+    measures the thing that's actually being optimized for.
+
+    Runs on an interval of raw batch count (independent of the Composer
+    Trainer's own `eval_interval`/forward-pass eval), with a small sample size
+    by default to keep per-call overhead low (`generate()` is far more
+    expensive than a forward pass -- one full iterative flow solve + decoder
+    read-out per revelation round, per example, at batch size 1).
+    """
+
+    def __init__(
+        self,
+        num_samples: int = 20,
+        eval_interval: int = 2000,
+        max_new_tokens: int = 64,
+        num_flow_steps: int = 16,
+        do_sample: bool = False,
+        split: str = "validation",
+        dataset_path: str = "wmt14",
+        config_name: str = "de-en",
+        source_lang: str = "de",
+        target_lang: str = "en",
+        max_source_length: int = 96,
+        max_target_length: int = 96,
+    ):
+        super().__init__()
+        self.num_samples = num_samples
+        self.eval_interval = eval_interval
+        self.max_new_tokens = max_new_tokens
+        self.num_flow_steps = num_flow_steps
+        self.do_sample = do_sample
+        self.split = split
+        self.dataset_path = dataset_path
+        self.config_name = config_name
+        self.source_lang = source_lang
+        self.target_lang = target_lang
+        self.max_source_length = max_source_length
+        self.max_target_length = max_target_length
+        self._dataset = None
+
+    @staticmethod
+    def _get_model(state: State):
+        """Get the raw denoiser, unwrapping DDP/HuggingFaceModel layers."""
+        model = state.model
+        if hasattr(model, "module"):
+            model = model.module
+        if hasattr(model, "model"):
+            model = model.model
+        return model
+
+    def _get_dataset(self, tokenizer):
+        if self._dataset is None:
+            from src.datasets.tokenize_on_demand import WMTDataset
+
+            self._dataset = WMTDataset(
+                tokenizer=tokenizer,
+                split=self.split,
+                dataset_path=self.dataset_path,
+                config_name=self.config_name,
+                source_lang=self.source_lang,
+                target_lang=self.target_lang,
+                max_source_length=self.max_source_length,
+                max_target_length=self.max_target_length,
+                add_special_tokens=True,
+                truncate=True,
+                separate_input_output=True,
+            )
+        return self._dataset
+
+    def batch_end(self, state: State, logger: Logger) -> None:
+        if dist.get_global_rank() != 0:
+            return
+        batch_count = int(state.timestamp.batch.value)
+        if batch_count == 0 or batch_count % self.eval_interval != 0:
+            return
+
+        model = self._get_model(state)
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer is None or not hasattr(model, "generate"):
+            log.warning(
+                "BLEUEvalCallback: model has no usable tokenizer/generate(); skipping."
+            )
+            return
+
+        dataset = self._get_dataset(tokenizer)
+        num_samples = min(self.num_samples, len(dataset))
+        device = next(model.parameters()).device
+
+        was_training = model.training
+        model.eval()
+        hypotheses, references = [], []
+        try:
+            with torch.no_grad():
+                for idx in range(num_samples):
+                    example = dataset[idx]
+                    input_ids = example["input_ids"].unsqueeze(0).to(device)
+                    reference = dataset.dataset[idx]["translation"][self.target_lang]
+                    outputs = model.generate(
+                        inputs=input_ids,
+                        max_new_tokens=self.max_new_tokens,
+                        num_flow_steps=self.num_flow_steps,
+                        do_sample=self.do_sample,
+                        return_dict_in_generate=True,
+                    )
+                    generated_ids = outputs.sequences[0, input_ids.shape[-1] :]
+                    hypotheses.append(
+                        tokenizer.decode(generated_ids, skip_special_tokens=True)
+                    )
+                    references.append(reference)
+        finally:
+            if was_training:
+                model.train()
+
+        from src.tasks.translation_metrics import compute_corpus_bleu, compute_corpus_chrf
+
+        bleu = compute_corpus_bleu(hypotheses, references)
+        chrf = compute_corpus_chrf(hypotheses, references)
+        logger.log_metrics({"eval_gen/bleu": bleu, "eval_gen/chrf": chrf})
+        log.info(
+            "BLEUEvalCallback @ batch %d: BLEU=%.2f chrF=%.2f (n=%d)",
+            batch_count,
+            bleu,
+            chrf,
+            num_samples,
+        )

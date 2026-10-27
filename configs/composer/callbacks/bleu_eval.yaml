@@ -1,0 +1,14 @@
+bleu_eval:
+  _target_: src.custom_composer.callbacks.BLEUEvalCallback
+  num_samples: 20
+  eval_interval: 2000
+  max_new_tokens: 64
+  num_flow_steps: 16
+  do_sample: false
+  split: validation
+  dataset_path: wmt14
+  config_name: de-en
+  source_lang: de
+  target_lang: en
+  max_source_length: 96
+  max_target_length: 96

@@ -161,7 +161,7 @@ class AdaptiveBlockFlowEmbed(AdaptiveBlockFlow):
             bool_mask[:, None, :, :], dtype=torch.float32
         )
 
-        tokens_mask = active_mask.to(torch.float32)
+        tokens_mask = self._window_tokens_mask(active_mask)
 
         return DenoiserInput(
             xt=input_ids,

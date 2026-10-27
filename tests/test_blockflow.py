@@ -161,6 +161,68 @@ def test_sampler_validity_endpoint_distribution():
     )
 
 
+def test_windowed_tokens_mask_restricts_scored_positions():
+    """With `window_size` set, tokens_mask scores only the nearest
+    `window_size` active positions (in canvas order), not the whole active
+    set -- concentrating loss signal on the near-term positions that actually
+    get committed soon."""
+    WINDOW = 2
+    backbone_config = {
+        "_target_": "src.backbone.dit_continuous.ContinuousDIT",
+        "length": LENGTH,
+        "causal_attention": False,
+        "adaln": True,
+        "hidden_size": 16,
+        "cond_dim": 16,
+        "n_heads": 2,
+        "num_layers": 2,
+        "dropout": 0.0,
+        "tie_word_embeddings": True,
+        "vocab_size": VOCAB_SIZE,
+        "block_size": COMMIT_SIZE,
+        "attn_backend": "sdpa",
+        "pretrained_model_name_or_path": None,
+    }
+    tokenization_config = {
+        "vocab_size": VOCAB_SIZE,
+        "mask_token_id": None,
+        "pad_token_id": 0,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "pad_vocab_size_multiple": None,
+    }
+    config = AdaptiveBlockFlowConfig(
+        commit_size=COMMIT_SIZE,
+        sampling_eps=1e-3,
+        window_size=WINDOW,
+        length=LENGTH,
+        backbone_config=backbone_config,
+        noise_config=None,
+        tokenization_config=tokenization_config,
+        attn_backend="sdpa",
+    )
+    model = AdaptiveBlockFlow(config, tokenizer=object())
+    model.eval()
+
+    input_ids, attention_mask, context_mask = _toy_batch(batch_size=4)
+    denoiser_inputs = model._prepare_inputs(input_ids, attention_mask, context_mask)
+    tokens_mask = denoiser_inputs.tokens_mask.bool()
+    active_mask = denoiser_inputs.active_mask
+
+    # Windowed mask is always a subset of the full active set.
+    assert torch.equal(tokens_mask & active_mask, tokens_mask)
+    for i in range(input_ids.shape[0]):
+        num_active = int(active_mask[i].sum().item())
+        num_scored = int(tokens_mask[i].sum().item())
+        assert num_scored == min(WINDOW, num_active)
+        # The scored positions are exactly the first WINDOW active ones in
+        # canvas order (lowest position indices among active positions).
+        active_positions = active_mask[i].nonzero(as_tuple=True)[0]
+        expected_scored = set(active_positions[:WINDOW].tolist())
+        actual_scored = set(tokens_mask[i].nonzero(as_tuple=True)[0].tolist())
+        assert actual_scored == expected_scored
+
+
 def test_commit_immutability_during_generation():
     """Once committed, a position's id is never overwritten by a later round."""
     model = _make_model()

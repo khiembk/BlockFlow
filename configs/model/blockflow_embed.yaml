@@ -6,6 +6,12 @@ _target_: src.denoiser.blockflow_embed.AdaptiveBlockFlowEmbed
 config:
   _target_: src.denoiser.blockflow_embed.AdaptiveBlockFlowEmbedConfig
   commit_size: ${block_size}
+  # Bounds the loss to the nearest `window_size` active positions (canvas
+  # order) instead of every remaining target position -- concentrates
+  # gradient signal on the near-term positions that actually get committed,
+  # matching this repo's BD3LM/SetDLM bounded denoising granularity (8-16
+  # tokens) rather than an unbounded remaining span.
+  window_size: ${window_size}
   noise_config: null
   t5_model_name: t5-small
   t5_embed_dim: 512
