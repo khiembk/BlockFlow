@@ -1,0 +1,18 @@
+_target_: src.backbone.dit_continuous_embed.EmbeddingSpaceContinuousDIT
+length: ${model.config.length}
+causal_attention: false
+adaln: true
+hidden_size: -1
+cond_dim: 128
+n_heads: -1
+num_layers: -1
+dropout: 0.1
+tie_word_embeddings: false
+attn_backend: sdpa
+vocab_size: -1
+block_size: ${block_size}
+pretrained_model_name_or_path: ${pretrained_model_name_or_path}
+# T5-small's encoder output dim; the trainable bottleneck adapter bridges this
+# to `hidden_size`, so hidden_size is free (no longer forced to equal 512).
+t5_embed_dim: 512
+bottleneck_dim: 128

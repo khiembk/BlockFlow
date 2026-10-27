@@ -103,24 +103,25 @@ class AdaptiveBlockFlow(Denoiser):
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
-    def _prepare_inputs(
+    def _sample_revelation_masks(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        context_mask: Optional[torch.FloatTensor] = None,
-        t: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Cache] = None,
-    ) -> DenoiserInput:
-        del past_key_values
+        attention_mask: torch.BoolTensor,
+        context_mask: torch.BoolTensor,
+    ) -> tuple[
+        torch.BoolTensor, torch.BoolTensor, torch.BoolTensor, torch.LongTensor
+    ]:
+        """Samples a nonterminal revelation round and builds the resulting
+        committed/active/clean masks (spec Algorithm 1). Pure mask logic, no
+        interpolant construction -- shared by `AdaptiveBlockFlow` (one-hot
+        vocab-space interpolant) and `AdaptiveBlockFlowEmbed` (T5-embedding-space
+        interpolant), which only differ in what continuous representation they
+        build on top of these masks.
+
+        Returns `(committed_mask, active_mask, clean_mask, position_idx)`.
+        """
         device = input_ids.device
         batch_size, seq_len = input_ids.shape
-
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-        if context_mask is None:
-            context_mask = torch.zeros_like(input_ids)
-        attention_mask = attention_mask.to(torch.bool)
-        context_mask = context_mask.to(torch.bool)
 
         # tokens_mask convention matches setdlm.py/mdlm.py: valid & non-context.
         target_valid = attention_mask & ~context_mask
@@ -160,6 +161,30 @@ class AdaptiveBlockFlow(Denoiser):
         committed_mask = target_valid & (target_rank < committed_count[:, None])
         active_mask = target_valid & ~committed_mask
         clean_mask = (context_mask | committed_mask) & attention_mask
+        return committed_mask, active_mask, clean_mask, position_idx
+
+    def _prepare_inputs(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        context_mask: Optional[torch.FloatTensor] = None,
+        t: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Cache] = None,
+    ) -> DenoiserInput:
+        del past_key_values
+        device = input_ids.device
+        batch_size, seq_len = input_ids.shape
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        if context_mask is None:
+            context_mask = torch.zeros_like(input_ids)
+        attention_mask = attention_mask.to(torch.bool)
+        context_mask = context_mask.to(torch.bool)
+
+        _committed_mask, active_mask, clean_mask, position_idx = (
+            self._sample_revelation_masks(input_ids, attention_mask, context_mask)
+        )
 
         # Continuous interpolant (spec Eq. 1).
         if t is None:

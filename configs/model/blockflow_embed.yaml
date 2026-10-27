@@ -1,0 +1,20 @@
+defaults:
+  - base@_here_
+  - _self_
+
+_target_: src.denoiser.blockflow_embed.AdaptiveBlockFlowEmbed
+config:
+  _target_: src.denoiser.blockflow_embed.AdaptiveBlockFlowEmbedConfig
+  commit_size: ${block_size}
+  noise_config: null
+  t5_model_name: t5-small
+  t5_embed_dim: 512
+  # Empirically measured t5-small encoder-output std (see Stage 1 v3 plan);
+  # activation-scale normalization only, never a weight copy.
+  latent_mean: 0.0
+  latent_std: 0.15
+  noise_scale: 2.0
+  decoder_prob: 0.2
+  decoder_p_mean: -1.5
+  decoder_p_std: 0.8
+  decoder_noise_scale: 2.0
