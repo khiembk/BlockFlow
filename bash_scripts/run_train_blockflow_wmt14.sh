@@ -34,7 +34,10 @@ WINDOW_SIZE="${WINDOW_SIZE:-16}"
 # dimension mismatch (unlike the embedding-space adapter). This means we are
 # not using ELF-B's 768-hidden sizing for this experiment.
 HIDDEN_SIZE="${HIDDEN_SIZE:-512}"
-N_LAYERS=12
+# Scaled from 12->24 layers (hidden/heads unchanged, preserving pretrained-
+# embedding compatibility) to land at ~135M total params (measured: 134.6M),
+# up from the 12-layer config's 92.1M.
+N_LAYERS="${N_LAYERS:-24}"
 N_HEADS="${N_HEADS:-8}"
 # Default to a de/en-scoped ~32k vocab (T5-small's tokenizer, same choice as
 # the sibling CorrFlow/ELF-B project) rather than bert-base-multilingual-cased's
@@ -64,6 +67,13 @@ BATCH_SIZE=256
 MAX_DURATION="${MAX_DURATION:-200000ba}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-2000ba}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-2000ba}"
+# LR schedulers are stateless pure functions of elapsed training time (no
+# state_dict), so switching this on a resume (same run_name/hydra.run.dir,
+# autoresume picks up the existing checkpoint) is safe and doesn't restart
+# training. cosine_annealing_with_warmup decays to alpha_f=0.0 by max_duration
+# -- constant_with_warmup never decays, which plausibly caused the BLEU/loss
+# plateau observed after ~20k batches.
+LR_SCHEDULER="${LR_SCHEDULER:-constant_with_warmup}"
 
 PRETRAINED_MODEL_NAME_OR_PATH=null
 
@@ -94,6 +104,23 @@ fi
 NUM_WORKERS=0
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+LR_SCHEDULER_ARGS=(composer/lr_scheduler=${LR_SCHEDULER})
+if [[ "${LR_SCHEDULER}" == "constant_with_warmup" ]]; then
+    LR_SCHEDULER_ARGS+=(composer.lr_scheduler.t_warmup=${WARMUP_DURATION})
+elif [[ "${LR_SCHEDULER}" == "cosine_annealing_with_warmup" ]]; then
+    # The file's own default (`t_warmup: ${eval:${composer.trainer.max_duration*0.1}}`)
+    # has invalid nested-interpolation syntax (OmegaConf's `eval:` resolver takes a
+    # string, not a nested `${...}` node) and has never actually been exercised, so
+    # override explicitly. t_warmup=0 (not 10%) since this scheduler is swapped in
+    # mid-run (same run_name, autoresume) to add decay for the remainder of an
+    # already-warmed-up training run, not to re-warm up from scratch.
+    LR_SCHEDULER_ARGS+=(
+        composer.lr_scheduler.t_warmup=0ba
+        composer.lr_scheduler.t_max=${MAX_DURATION}
+        composer.lr_scheduler.alpha_f=0.0
+    )
+fi
+
 composer -n ${NUM_VISIBLE_DEVICES} scripts/composer_scripts/train_discrete_denoiser.py \
   run_name=${RUN_NAME} \
   pretrained_model_name_or_path=${PRETRAINED_MODEL_NAME_OR_PATH} \
@@ -107,8 +134,7 @@ composer -n ${NUM_VISIBLE_DEVICES} scripts/composer_scripts/train_discrete_denoi
   composer.trainer.eval_interval=${EVAL_INTERVAL} \
   composer.trainer.max_duration=${MAX_DURATION} \
   composer.trainer.save_num_checkpoints_to_keep=1 \
-  composer/lr_scheduler=constant_with_warmup \
-  composer.lr_scheduler.t_warmup=${WARMUP_DURATION} \
+  "${LR_SCHEDULER_ARGS[@]}" \
   composer/callbacks=[hf_compatible_checkpointing,lr_monitor,runtime_estimator,save_best_checkpointing,speed_monitor,bleu_eval] \
   composer.callbacks.bleu_eval.num_samples=${BLEU_NUM_SAMPLES:-20} \
   composer.callbacks.bleu_eval.eval_interval=${BLEU_EVAL_INTERVAL:-2000} \
