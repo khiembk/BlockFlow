@@ -19,7 +19,17 @@ RUN_DIR="${RUN_DIR:-/scratch/${USER}/blockflow_outputs}"
 LENGTH=128
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 EVAL_BLOCK_SIZE=${BLOCK_SIZE}
-WINDOW_SIZE="${WINDOW_SIZE:-16}"
+# window_size=null scores the loss over the ENTIRE active span every step
+# (AdaptiveBlockFlow._window_tokens_mask returns the full active_mask when
+# window_size is None), not just the nearest BLOCK_SIZE tokens. The prior
+# win16 LM1B run restricted loss to one ~16-token window per step -- far
+# sparser supervision per step than BD3LM/SetDLM's `tokens_mask =
+# attention_mask * (1 - context_mask)` (full remaining-span, every step).
+# That run (deleted) reached eval ppl ~100 but gen_ppl 900-1700 unconditionally,
+# vs. a comparable 170M absorbing-diffusion baseline reaching gen_ppl ~281
+# with 3x less training data -- see conversation notes. This is the direct,
+# already-implemented, zero-new-code fix for that gap.
+WINDOW_SIZE="${WINDOW_SIZE:-null}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-512}"
 N_LAYERS="${N_LAYERS:-24}"
 N_HEADS="${N_HEADS:-8}"
