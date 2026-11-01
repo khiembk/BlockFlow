@@ -22,15 +22,30 @@ log = logging.getLogger(__name__)
 
 
 class ContinuousEmbedding(nn.Module):
-    """Projects continuous vocabulary-space vectors (Gaussian/simplex) to model width."""
+    """Projects continuous vocabulary-space vectors (Gaussian/simplex) to model width.
+
+    A 2-layer MLP (Linear -> GELU -> Linear), not a single linear layer: a
+    single linear map can only compute weighted sums of the ~30k noisy input
+    coordinates, but identifying "which coordinate is the outlier relative to
+    its expected Gaussian noise band" is a comparison/ranking operation that
+    isn't representable as one linear map. The intermediate nonlinearity lets
+    this module do at least one round of that comparison before the lossy
+    compression down to `dim`, rather than deferring all of it to the
+    transformer body acting on an already-compressed, already-lossy vector.
+    """
 
     def __init__(self, dim: int, vocab_dim: int):
         super().__init__()
-        self.proj = nn.Linear(vocab_dim, dim, bias=False)
-        nn.init.kaiming_uniform_(self.proj.weight, a=math.sqrt(5))
+        self.net = nn.Sequential(
+            nn.Linear(vocab_dim, dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(dim, dim, bias=False),
+        )
+        nn.init.kaiming_uniform_(self.net[0].weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.net[2].weight, a=math.sqrt(5))
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.proj(z)
+        return self.net(z)
 
 
 class ContinuousDIT(DIT):
@@ -42,12 +57,14 @@ class ContinuousDIT(DIT):
       - ``self.continuous_embed(continuous_states)`` if the position is active
         (uncommitted, holding a Gaussian-to-categorical flow state).
 
-    Time conditioning (``t``) is applied globally via the existing AdaLN-Zero
-    mechanism inherited from ``DIT``/``DDiTBlock``. This is a documented
-    simplification: the spec's caching contract (Section 6.1) wants clean-context
-    representations independent of flow time so they can be safely cached, but
-    this backbone is only ever used uncached (Stage 1, M1/M2); revisit when
-    KV-caching (M3) is implemented.
+    Time conditioning (``t``) is applied via the existing AdaLN-Zero mechanism
+    inherited from ``DIT``/``DDiTBlock``, either globally (``t`` shape ``(B,)``,
+    one flow time per example, broadcast to every position) or per-position
+    (``t`` shape ``(B, L)``, e.g. independent per-block noise levels -- see
+    ``AdaptiveBlockFlow._prepare_inputs``). This backbone is only ever used
+    uncached (Stage 1, M1/M2); the spec's caching contract (Section 6.1) wants
+    clean-context representations independent of flow time so they can be
+    safely cached -- revisit when KV-caching (M3) is implemented.
     """
 
     def __init__(
@@ -160,7 +177,15 @@ class ContinuousDIT(DIT):
 
         if t is None:
             raise ValueError("ContinuousDIT.forward requires `t` (flow time).")
-        t_cond = F.silu(self.sigma_map(t))
+        if t.dim() == 2:
+            # Per-position flow time (e.g. independent per-block noise levels):
+            # (B, L) -> flatten through the scalar-time embedder -> (B, L, cond_dim).
+            batch_size, seq_len = t.shape
+            t_cond = F.silu(self.sigma_map(t.reshape(-1))).reshape(
+                batch_size, seq_len, -1
+            )
+        else:
+            t_cond = F.silu(self.sigma_map(t))
 
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[-1], device=input_ids.device)[

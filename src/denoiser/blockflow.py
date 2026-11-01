@@ -21,6 +21,7 @@ from src.denoiser.base import (
     DenoiserInput,
     LossAndNllOutput,
 )
+from src.denoiser.time_reparam import TimeReparam
 from src.rl.policy import RevelationPolicy
 
 log = logging.getLogger(__name__)
@@ -92,14 +93,20 @@ class AdaptiveBlockFlow(Denoiser):
     `window_size` (optional) bounds what the *loss* scores to the nearest
     `window_size` active positions in canvas order, instead of every active
     position (which can be nearly the full remaining target length in early
-    rounds). This doesn't change the round/commit mechanics, the attention
-    contract, or the continuous interpolant at all -- every active position is
-    still given an interpolant and attended to exactly as before, so there is
-    no risk of degenerate all-masked attention rows. It only concentrates
-    gradient signal on the near-term positions that actually get committed
-    soon, matching this repo's BD3LM/SetDLM configs, which denoise a bounded
-    8-16 token unit per step rather than an unbounded remaining span.
-    `window_size=None` (default) preserves scoring every active position.
+    rounds). `window_size=None` (default) scores every active position --
+    matching BD3LM/SetDLM's dense `tokens_mask = attention_mask * (1 -
+    context_mask)` convention (every remaining target position gets gradient
+    every step, not just a narrow window).
+
+    Each block (`commit_size` contiguous active positions) within the active
+    span is independently noised at its own sampled flow time, rather than
+    the whole active span sharing one scalar t -- another BD3LM/SetDLM-style
+    density trick (one forward pass teaches many different "how corrupted is
+    this block" lessons at once). To stay consistent, active-to-active
+    attention is isolated per block (a block being denoised never attends to
+    a sibling block's different, unrelated noise level -- it only ever sees
+    the clean prefix and its own block, exactly like `generate`'s per-round
+    behavior, which was narrowed to one block at a time to match).
     """
 
     config_class = AdaptiveBlockFlowConfig
@@ -114,6 +121,12 @@ class AdaptiveBlockFlow(Denoiser):
         self.commit_size = config.commit_size
         self.sampling_eps = config.sampling_eps
         self.window_size = config.window_size
+        # See src/denoiser/time_reparam.py: for this vocab size, raw
+        # interpolation time t is NOT uniform in task difficulty -- most of
+        # [0,1] is either trivial or unsolvable. Sampling (training) and
+        # step-spacing (generation) happen in tau (uniform-in-difficulty)
+        # space instead, mapped through this vocab-size-specific LUT.
+        self._time_reparam = TimeReparam(vocab_size=self.vocab_size)
 
     def _window_tokens_mask(self, active_mask: torch.BoolTensor) -> torch.FloatTensor:
         """Restricts the scored (loss) positions to the nearest `window_size`
@@ -123,6 +136,19 @@ class AdaptiveBlockFlow(Denoiser):
         active_rank = torch.cumsum(active_mask.to(torch.long), dim=-1) - 1
         windowed = active_mask & (active_rank < self.window_size)
         return windowed.to(torch.float32)
+
+    def _active_block_idx(
+        self, active_mask: torch.BoolTensor, commit_size: int
+    ) -> torch.LongTensor:
+        """Per-position block index within the active span, in canvas order
+        (block 0 = the next `commit_size` active positions to be committed,
+        block 1 = the following `commit_size`, etc.). Values at non-active
+        positions are unused filler (never read: they're never both query and
+        key in the active-active attention/t-gather terms that consume this)."""
+        active_rank = torch.cumsum(active_mask.to(torch.long), dim=-1) - 1
+        return torch.div(
+            active_rank.clamp(min=0), commit_size, rounding_mode="floor"
+        )
 
     # ------------------------------------------------------------------
     # Training
@@ -209,13 +235,23 @@ class AdaptiveBlockFlow(Denoiser):
         _committed_mask, active_mask, clean_mask, position_idx = (
             self._sample_revelation_masks(input_ids, attention_mask, context_mask)
         )
+        block_idx = self._active_block_idx(active_mask, self.commit_size)
 
-        # Continuous interpolant (spec Eq. 1).
+        # Continuous interpolant (spec Eq. 1). Each block within the active
+        # span gets its own independently-sampled flow time (BD3LM/SetDLM-style
+        # per-block noise diversity -- every block is a different "how corrupted
+        # is this" lesson in the same forward pass), rather than one shared t
+        # for the whole active span. Sampled uniformly in tau (task-difficulty)
+        # space, not raw t -- see `_time_reparam` / time_reparam.py.
         if t is None:
-            t = (
-                torch.rand(batch_size, device=device) * (1 - 2 * self.sampling_eps)
+            max_blocks = (seq_len + self.commit_size - 1) // self.commit_size
+            tau_per_block = (
+                torch.rand(batch_size, max_blocks, device=device)
+                * (1 - 2 * self.sampling_eps)
                 + self.sampling_eps
             )
+            t_per_block = self._time_reparam.tau_to_t(tau_per_block)
+            t = torch.gather(t_per_block, dim=1, index=block_idx)
         t = t.to(torch.float32)
         x0_noise = torch.randn(
             batch_size, seq_len, self.vocab_size, device=device, dtype=torch.float32
@@ -223,11 +259,20 @@ class AdaptiveBlockFlow(Denoiser):
         one_hot_target = F.one_hot(input_ids.clamp(min=0), self.vocab_size).to(
             torch.float32
         )
-        t_broadcast = t[:, None, None]
+        t_broadcast = t[..., None] if t.dim() == 2 else t[:, None, None]
         continuous_states = (1 - t_broadcast) * x0_noise + t_broadcast * one_hot_target
 
+        # Clean/committed positions are fully resolved (z_1 = x0), so their AdaLN
+        # conditioning time is fixed at 1.0 -- not whichever active block's time
+        # the gather above happened to assign them (block indices are undefined/
+        # unused filler at non-active positions; see `_active_block_idx`).
+        t_cond_input = torch.where(active_mask, t, torch.ones_like(t)) if t.dim() == 2 else t
+
         bool_mask = self._build_attention_mask(
-            clean_mask=clean_mask, active_mask=active_mask, position_idx=position_idx
+            clean_mask=clean_mask,
+            active_mask=active_mask,
+            position_idx=position_idx,
+            block_idx=block_idx,
         )
         bool_mask = bool_mask & attention_mask[:, None, :]
         float_mask = self._preprocess_attention_mask(
@@ -245,7 +290,7 @@ class AdaptiveBlockFlow(Denoiser):
             active_mask=active_mask,
             continuous_states=continuous_states,
             t=t,
-            backbone_kwargs={"position_ids": position_idx, "t": t},
+            backbone_kwargs={"position_ids": position_idx, "t": t_cond_input},
         )
 
     @staticmethod
@@ -253,24 +298,32 @@ class AdaptiveBlockFlow(Denoiser):
         clean_mask: torch.BoolTensor,
         active_mask: torch.BoolTensor,
         position_idx: torch.LongTensor,
+        block_idx: Optional[torch.LongTensor] = None,
     ) -> torch.BoolTensor:
         """Three-way source/committed/active attention contract (spec Section 6.1).
 
         clean queries may only attend causally to earlier-or-equal clean keys
         (source always precedes committed targets, and committed targets are
         ordered by their absolute position under left-to-right commitment);
-        active queries attend to all clean keys and all other active keys.
+        active queries attend to all clean keys and, if `block_idx` is given,
+        only to active keys in their OWN block (BD3LM-style isolation -- a
+        block being independently denoised at its own flow time must never
+        peek at a sibling block's different, unrelated noise level, which
+        never happens at generation time either). `block_idx=None` (default)
+        preserves the original unrestricted active-sees-all-active behavior,
+        used by `AdaptiveBlockFlowEmbed` and anywhere a single shared flow
+        time is used for the whole active span.
         """
         causal_among_clean = position_idx[:, None, :] <= position_idx[:, :, None]
         clean_q = clean_mask[:, :, None]
         clean_k = clean_mask[:, None, :]
         active_q = active_mask[:, :, None]
         active_k = active_mask[:, None, :]
-        return (
-            (clean_q & clean_k & causal_among_clean)
-            | (active_q & clean_k)
-            | (active_q & active_k)
-        )
+        active_active = active_q & active_k
+        if block_idx is not None:
+            same_block = block_idx[:, :, None] == block_idx[:, None, :]
+            active_active = active_active & same_block
+        return (clean_q & clean_k & causal_among_clean) | (active_q & clean_k) | active_active
 
     def _backbone_forward(
         self,
@@ -317,6 +370,7 @@ class AdaptiveBlockFlow(Denoiser):
         position_idx: torch.LongTensor,
         num_flow_steps: int,
         request_hidden_states: bool = False,
+        max_active_positions: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.BoolTensor, Optional[torch.Tensor], int]:
         """Solve the Gaussian-to-categorical flow over all active positions for one
         revelation round (spec Algorithm 2, inner loop / Eq. 4 Euler sampler).
@@ -325,12 +379,27 @@ class AdaptiveBlockFlow(Denoiser):
         (policy-driven commitment) so there is exactly one tested implementation
         of "solve the flow over everything not yet committed."
 
+        `max_active_positions` (optional) narrows the active span to just the
+        first `max_active_positions` not-yet-committed positions in canvas
+        order (used by `generate` to match training's per-block-isolated
+        regime: beyond-the-current-block positions aren't attended to by
+        anyone and effectively "don't exist yet" this round, same as a block
+        that hasn't started its own denoising trajectory). `rollout_for_grpo`
+        leaves this `None` (full remaining span) since the policy needs the
+        whole active set to choose a variable-size commit -- NOTE: this means
+        Stage 2 rollouts currently run the frozen Stage-1 generator in a
+        wider-active-span regime than Stage 1 is now trained under; revisit
+        together with any Stage 2 training resumption.
+
         Returns `(p_theta, active_mask, hidden_state, nfe)`, where `hidden_state`
         is the backbone's final pre-output-layer representation from the last
         Euler step (only computed/returned if `request_hidden_states=True`).
         """
         device = sequence.device
         active_mask = (~committed_mask) & attention_mask_valid
+        if max_active_positions is not None:
+            active_rank = torch.cumsum(active_mask.to(torch.long), dim=-1) - 1
+            active_mask = active_mask & (active_rank < max_active_positions)
         clean_mask = committed_mask & attention_mask_valid
         bool_mask = self._build_attention_mask(
             clean_mask=clean_mask, active_mask=active_mask, position_idx=position_idx
@@ -341,7 +410,11 @@ class AdaptiveBlockFlow(Denoiser):
         )
 
         z = torch.randn(1, canvas_length, self.vocab_size, device=device)
-        timesteps = torch.linspace(0.0, 1.0, num_flow_steps + 1, device=device)
+        # Euler steps spaced uniformly in tau (task-difficulty), not raw t --
+        # see `_time_reparam`. Concentrates steps where t actually transitions
+        # from "unsolvable" to "trivial" instead of wasting steps on either end.
+        tau_steps = torch.linspace(0.0, 1.0, num_flow_steps + 1, device=device)
+        timesteps = self._time_reparam.tau_to_t(tau_steps)
         p_theta = None
         hidden_state = None
         nfe = 0
@@ -349,13 +422,20 @@ class AdaptiveBlockFlow(Denoiser):
             t_cur = timesteps[step].expand(1)
             t_next = timesteps[step + 1]
             is_last_step = step == num_flow_steps - 1
+            # Matches training's convention: the active block's own flow time
+            # conditions its positions; clean/committed positions (fully
+            # resolved, z_1 = x0) are fixed at t=1 rather than inheriting this
+            # round's active-block time.
+            t_cond_input = torch.where(
+                active_mask, t_cur, torch.ones_like(active_mask, dtype=torch.float32)
+            )
             backbone_output = self._backbone_forward(
                 DenoiserInput(
                     xt=sequence,
                     continuous_states=z,
                     active_mask=active_mask,
                     attention_mask=float_mask,
-                    backbone_kwargs={"position_ids": position_idx, "t": t_cur},
+                    backbone_kwargs={"position_ids": position_idx, "t": t_cond_input},
                 ),
                 output_hidden_states=(request_hidden_states and is_last_step),
             )
@@ -425,6 +505,7 @@ class AdaptiveBlockFlow(Denoiser):
                 canvas_length=canvas_length,
                 position_idx=position_idx,
                 num_flow_steps=num_flow_steps,
+                max_active_positions=self.commit_size,
             )
             total_nfe += nfe
 

@@ -248,6 +248,7 @@ class AdaptiveBlockFlowEmbed(AdaptiveBlockFlow):
         position_idx: torch.LongTensor,
         num_flow_steps: int,
         request_hidden_states: bool = False,
+        max_active_positions: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.BoolTensor, Optional[torch.Tensor], int]:
         """Solves the Gaussian-to-T5-embedding flow over active positions for one
         revelation round, then runs one extra decoder-branch forward pass on the
@@ -264,6 +265,9 @@ class AdaptiveBlockFlowEmbed(AdaptiveBlockFlow):
         """
         device = sequence.device
         active_mask = (~committed_mask) & attention_mask_valid
+        if max_active_positions is not None:
+            active_rank = torch.cumsum(active_mask.to(torch.long), dim=-1) - 1
+            active_mask = active_mask & (active_rank < max_active_positions)
         clean_mask = committed_mask & attention_mask_valid
         clean_len = int(clean_mask[0].sum().item())
 

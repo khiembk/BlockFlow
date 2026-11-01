@@ -863,7 +863,13 @@ class DDiTBlock(nn.Module):
             None,
             None,
         )
-        if c is not None and c.shape[0] == batch_size:
+        if c is not None and c.dim() == 3:
+            # Per-position conditioning: one cond vector per sequence position
+            # (e.g. independent per-block flow time), already shaped (b, s, d).
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.adaLN_modulation(c).chunk(6, dim=-1)
+            )
+        elif c is not None and c.shape[0] == batch_size:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                 self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
             )
@@ -991,7 +997,10 @@ class DDiTFinalLayer(nn.Module):
     def forward(self, x, c):
         x = self.norm_final(x)
         if c is not None:
-            if c.shape[0] == x.shape[0]:
+            if c.dim() == 3:
+                # Per-position conditioning, already shaped (b, s, d).
+                shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+            elif c.shape[0] == x.shape[0]:
                 shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
             else:
                 shift, scale = rearrange(
